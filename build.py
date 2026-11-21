@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Builds docs/<PluginId>.zip and docs/index.yml for a Stash plugin source.
+"""Builds docs/<PluginId>.zip for each plugin folder and one docs/index.yml listing them all.
 
-Usage (run from the repo root):  python3 build.py <PluginFolder>
-Example:                         python3 build.py stashPlus
+Usage (run from the repo root, list every plugin folder to publish):
+    python3 build.py stashPlus ../stashoratings/stashOratings
 
-The folder must contain <PluginFolder>.yml with name, description and version.
+Each folder must contain <FolderName>.yml with name, description and version.
 Bump `version` in that yml before every release so Stash offers an update.
 """
 import hashlib
@@ -16,10 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def main():
-    if len(sys.argv) != 2:
-        sys.exit(__doc__)
-    folder = Path(sys.argv[1])
+def build(folder, out, date):
     pid = folder.name
     manifest = folder / f"{pid}.yml"
     if not manifest.is_file():
@@ -34,8 +31,6 @@ def main():
 
     name, desc, version = field("name"), field("description"), field("version")
 
-    out = Path("docs")
-    out.mkdir(exist_ok=True)
     zpath = out / f"{pid}.zip"
     # Plugin files go at the zip root; fixed timestamps keep the build reproducible.
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
@@ -47,8 +42,8 @@ def main():
                 z.writestr(info, f.read_bytes())
 
     sha = hashlib.sha256(zpath.read_bytes()).hexdigest()
-    date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    index = (
+    print(f"Built {zpath} (version {version}, sha256 {sha})")
+    return (
         f"- id: {pid}\n"
         f"  name: {json.dumps(name, ensure_ascii=False)}\n"
         f"  metadata:\n"
@@ -58,8 +53,17 @@ def main():
         f"  path: {pid}.zip\n"
         f"  sha256: {sha}\n"
     )
-    (out / "index.yml").write_text(index, encoding="utf-8")
-    print(f"Wrote {zpath} and {out / 'index.yml'} (sha256 {sha})")
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    out = Path("docs")
+    out.mkdir(exist_ok=True)
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    entries = [build(Path(arg), out, date) for arg in sys.argv[1:]]
+    (out / "index.yml").write_text("".join(entries), encoding="utf-8")
+    print(f"Wrote {out / 'index.yml'} with {len(entries)} plugin(s)")
 
 
 if __name__ == "__main__":
