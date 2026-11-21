@@ -2770,7 +2770,10 @@
           weight:  inOrder(weightMap, ["<50kg","50-59kg","60-69kg","70-79kg","80-89kg","90-99kg","100kg+"]),
         };
 
-        setState({ loading:false, error:null, data:{ growthDays, years, timeToO, streaks, rewatchTrend, heatmap, hourHeatmap, diversity } });
+        // Total O's across the library: O history entries when available, else the scene's o_counter.
+        const totalOs = scenes.reduce((sum, s) => { const n = (s.o_history || []).length; return sum + (n > 0 ? n : (s.o_counter || 0)); }, 0);
+
+        setState({ loading:false, error:null, data:{ growthDays, years, timeToO, streaks, rewatchTrend, heatmap, hourHeatmap, diversity, totalOs } });
       }).catch(err => { if (!cancelled) setState({ loading:false, error:err.message, data:null }); });
 
       return () => { cancelled = true; };
@@ -2779,7 +2782,7 @@
     if (state.loading) return h("div", { className:"stash-plus-loading" }, "Crunching library stats…");
     if (state.error)   return h("div", { className:"stash-plus-error" }, "Error: "+state.error);
 
-    const { growthDays, years, timeToO, streaks, rewatchTrend, heatmap, hourHeatmap, diversity } = state.data;
+    const { growthDays, years, timeToO, streaks, rewatchTrend, heatmap, hourHeatmap, diversity, totalOs } = state.data;
     const filteredDays = yearFilter==="all" ? growthDays : growthDays.filter(d=>String(d.year)===yearFilter);
     const maxDayCount = filteredDays.reduce((m,day)=>Math.max(m,day.scenes.length), 0);
     const shownDays = showAllDays ? filteredDays : filteredDays.slice(0, 30);
@@ -2792,6 +2795,15 @@
     );
 
     return h("div", null,
+      h("div", { className:"stash-plus-grid", style:{ marginBottom:"2rem" } },
+        h("div", { className:"stash-plus-card unlocked" },
+          h("div", { className:"stash-plus-card-icon" }, "💦"),
+          h("div", { className:"stash-plus-card-body" },
+            h("div", { className:"stash-plus-card-title" }, "Total O's"),
+            h("div", { className:"stash-plus-card-desc", style:{ fontSize:"1.6rem", fontWeight:700, opacity:1, marginBottom:0 } }, totalOs.toLocaleString())
+          )
+        )
+      ),
       h(CollapsibleSection, { title:"📈 Library Growth", storageKey:"libraryGrowth" },
         h("div", { style:{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:"0.5rem", marginBottom:"0.5rem" } },
           h("p", { className:"stash-plus-score-note", style:{ margin:0 } }, `Scenes added on ${filteredDays.length} distinct day${filteredDays.length!==1?"s":""}.`),

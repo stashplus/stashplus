@@ -1,6 +1,6 @@
 name: Stash+
 description: Achievements, rankings, stats and recommendations for your Stash library — performers, scenes, ratings, O-counts, and more.
-version: 1.0.0
+version: 1.1.0
 url: https://github.com/stashplus/stashplus
 ui:
   javascript:
