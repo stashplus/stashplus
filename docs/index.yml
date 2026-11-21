@@ -1,0 +1,8 @@
+- id: stashPlus
+  name: "Stash+"
+  metadata:
+    description: "Achievements, rankings, stats and recommendations for your Stash library — performers, scenes, ratings, O-counts, and more."
+  version: "1.0.0"
+  date: 2026-11-21 11:51:15
+  path: stashPlus.zip
+  sha256: ca54df8ff90a006dfe1ff02566745eec4590b4c249af58969c87a16b2a60d3ed
