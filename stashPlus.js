@@ -25,6 +25,138 @@
 
   const STORAGE_KEY = "stashPlusUnlocked";
 
+  // ── Settings (gender + excluded tags), persisted in localStorage ─────────
+  const SETTINGS_KEY = "stashPlusSettings";
+  const GENDER_OPTIONS = [
+    { key:"FEMALE", label:"Female" }, { key:"MALE", label:"Male" },
+    { key:"TRANSGENDER_FEMALE", label:"Trans female" }, { key:"TRANSGENDER_MALE", label:"Trans male" },
+    { key:"NON_BINARY", label:"Non-binary" }, { key:"INTERSEX", label:"Intersex" },
+    { key:"UNSPECIFIED", label:"Not specified" },
+  ];
+  // Performer fields the settings filters need (append to every performers { } query).
+  const PERF_FILTER_FIELDS = "gender birthdate hair_color height_cm weight";
+
+  const RANGE_DEFS = {
+    age:    { min:18,  max:80,  unit:"",    label:"Age" },
+    height: { min:140, max:200, unit:" cm", label:"Height" },
+    weight: { min:40,  max:120, unit:" kg", label:"Weight" },
+  };
+  // Hair colours are grouped by keyword (whole-word prefix match, first group wins),
+  // so "Brunette" also covers brown, chestnut, dark brown, etc.
+  const HAIR_GROUPS = [
+    { key:"red",         label:"Red (ginger, auburn…)",           words:["red","ginger","auburn","copper"] },
+    { key:"blonde",      label:"Blonde (golden, platinum…)",      words:["blond","golden","platinum"] },
+    { key:"brunette",    label:"Brunette (brown, chestnut…)",     words:["brun","brown","chestnut","chocolate","caramel"] },
+    { key:"black",       label:"Black (dark, jet…)",              words:["black","dark","jet","ebony"] },
+    { key:"grey",        label:"Grey / white / silver",           words:["grey","gray","silver","white","salt"] },
+    { key:"colourful",   label:"Colourful (blue, pink, purple…)", words:["blue","pink","purple","green","orange","violet","teal","rainbow","multi","colo"] },
+    { key:"other",       label:"Other (bald, various…)",          words:[] },
+    { key:"unspecified", label:"Not specified",                   words:[] },
+  ];
+  function hairGroupOf(str) {
+    const s = (str || "").toLowerCase().trim();
+    if (!s) return "unspecified";
+    const words = s.split(/[^a-zà-ÿ]+/).filter(Boolean);
+    for (const g of HAIR_GROUPS) if (g.words.length && words.some(w => g.words.some(k => w.startsWith(k)))) return g.key;
+    return "other";
+  }
+
+  function getSettings() {
+    const def = {
+      genders: GENDER_OPTIONS.map(g => g.key),
+      hairs: HAIR_GROUPS.map(g => g.key),
+      ageRange: [RANGE_DEFS.age.min, RANGE_DEFS.age.max],
+      heightRange: [RANGE_DEFS.height.min, RANGE_DEFS.height.max],
+      weightRange: [RANGE_DEFS.weight.min, RANGE_DEFS.weight.max],
+      includeUnknown: true,
+      excludedTags: [],
+    };
+    try {
+      const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") || {};
+      const out = { ...def };
+      ["genders", "hairs", "excludedTags"].forEach(k => { if (Array.isArray(raw[k])) out[k] = raw[k]; });
+      ["ageRange", "heightRange", "weightRange"].forEach(k => {
+        if (Array.isArray(raw[k]) && raw[k].length === 2 && raw[k].every(n => typeof n === "number")) out[k] = raw[k];
+      });
+      if (typeof raw.includeUnknown === "boolean") out.includeUnknown = raw.includeUnknown;
+      return out;
+    } catch (e) { return def; }
+  }
+  function saveSettings(s) { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (e) {} }
+
+  // Returns a performer predicate for the current settings, or null when no
+  // performer filter (gender/hair/age/height/weight) is active.
+  function makePerformerFilter(s) {
+    const genders = new Set(s.genders), hairs = new Set(s.hairs);
+    const gOn = GENDER_OPTIONS.some(g => !genders.has(g.key));
+    const hOn = HAIR_GROUPS.some(g => !hairs.has(g.key));
+    const rangeOn = k => s[k + "Range"][0] > RANGE_DEFS[k].min || s[k + "Range"][1] < RANGE_DEFS[k].max;
+    const aOn = rangeOn("age"), htOn = rangeOn("height"), wOn = rangeOn("weight");
+    if (!gOn && !hOn && !aOn && !htOn && !wOn) return null;
+    const inRange = (val, k) => {
+      if (!(val > 0)) return s.includeUnknown;
+      const [lo, hi] = s[k + "Range"], d = RANGE_DEFS[k];
+      return (lo <= d.min || val >= lo) && (hi >= d.max || val <= hi);
+    };
+    return p => {
+      if (gOn && !genders.has(p.gender || "UNSPECIFIED")) return false;
+      if (hOn && !hairs.has(hairGroupOf(p.hair_color))) return false;
+      if (aOn && !inRange(getAge(p.birthdate), "age")) return false;
+      if (htOn && !inRange(Number(p.height_cm) || 0, "height")) return false;
+      if (wOn && !inRange(Number(p.weight) || 0, "weight")) return false;
+      return true;
+    };
+  }
+
+  // Applies the Settings tab to a list of scenes (each needs `tags{id}` and the
+  // PERF_FILTER_FIELDS on its performers). Scenes with an excluded tag are
+  // dropped; performers failing the filters are removed, and a scene left with
+  // no performers is dropped (only while a performer filter is active).
+  function applySettings(scenes) {
+    const s = getSettings();
+    const excl = new Set(s.excludedTags.map(t => String(t.id)));
+    const pf = makePerformerFilter(s);
+    if (!excl.size && !pf) return scenes;
+    const out = [];
+    scenes.forEach(sc => {
+      if (excl.size && (sc.tags || []).some(t => excl.has(String(t.id)))) return;
+      if (!pf) { out.push(sc); return; }
+      const performers = (sc.performers || []).filter(pf);
+      if (performers.length) out.push({ ...sc, performers });
+    });
+    return out;
+  }
+
+  // Searches performers using the WHOLE text box (any word order, accents
+  // ignored) and returns the best matches first. The server only narrows by the
+  // longest word; ranking is done here against the full typed text.
+  const normName = s => (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim();
+  async function searchPerformersBestMatch(text, limit) {
+    const q = normName(text);
+    if (q.length < 2) return [];
+    const tokens = q.split(" ");
+    const longest = tokens.reduce((a, b) => b.length > a.length ? b : a, "");
+    const d = await gqlQuery(`query($q: String!) {
+      findPerformers(performer_filter:{name:{value:$q, modifier:INCLUDES}} filter:{per_page:200}) {
+        performers { id name image_path ${PERF_FILTER_FIELDS} }
+      }
+    }`, { q: longest });
+    const pf = makePerformerFilter(getSettings());
+    const scored = [];
+    (d.findPerformers.performers || []).forEach(p => {
+      if (pf && !pf(p)) return;
+      const n = normName(p.name), words = n.split(" ");
+      let score = 0;
+      if (n === q) score = 100;
+      else if (n.startsWith(q)) score = 80;
+      else if (n.includes(q)) score = 60;
+      else if (tokens.every(t => words.some(w => w.startsWith(t)))) score = 50;
+      else if (tokens.every(t => n.includes(t))) score = 40;
+      if (score) scored.push({ p, score: score - Math.abs(n.length - q.length) / 100 });
+    });
+    return scored.sort((a, b) => b.score - a.score).slice(0, limit || 8).map(x => x.p);
+  }
+
   // One-time migration of saved data from the pre-rename "stashAchieve" keys.
   try {
     Object.keys(localStorage).forEach(k => {
@@ -182,6 +314,7 @@
       oScenes:   findScenes(scene_filter:{o_counter:{value:0,modifier:GREATER_THAN}} filter:{per_page:0}) { count }
     }`);
 
+    let oScenesForDates = []; // O\'d scenes, used for achievement completion dates
     const sceneOCounterMap = new Map(); // sceneId -> o_counter, used to cross-reference play_count later
 
     const result = {
@@ -214,7 +347,7 @@
       favoritePerformers:0, watchedScenes:0, maxPlayCount:0,
       groupScenes:0, soloScenes:0, noStudioScenes:0, unratedScenes:0,
       fiveStarPerformers:0, taggedScenes:0, imageCount5k:0, watched500:0,
-      hasTagAchievements: false, tagCounts: {},
+      hasTagAchievements: false, tagCounts: {}, tagIdsByCfg: {},
     };
 
     // Step 1.5: library-wide height/weight distribution (across ALL performers,
@@ -296,7 +429,7 @@
 
       async function tryFetch(withHistory, withWeight) {
         const perfFields = withWeight ? PERF_FIELDS_W : PERF_FIELDS_NW;
-        const sceneFields = withHistory ? "id title o_counter o_history rating100 paths { screenshot }" : "id title o_counter rating100 paths { screenshot }";
+        const sceneFields = withHistory ? "id title o_counter o_history rating100 tags { id } paths { screenshot }" : "id title o_counter rating100 tags { id } paths { screenshot }";
         const data = await gqlQuery(`query {
           findScenes(scene_filter:{o_counter:{value:0,modifier:GREATER_THAN}} filter:{per_page:-1}) {
             scenes {
@@ -331,6 +464,7 @@
       }
 
       result.hasODetail  = true;
+      oScenesForDates = scenes;
       result.hasOHistory = hasHistory;
       result.hasWeight   = hasWeight;
 
@@ -348,7 +482,8 @@
       const studioOSum           = new Map(); // studioId -> total O count across her scenes (counts doubles, unlike distinct scene count)
       const allTimestamps        = [];
       const timing               = {};
-      const timingCounts         = {}; // flag -> total number of O events matching (not just "at least one")
+      const timingCounts         = {};
+      const timingDates = {};   // flag -> earliest O (ms) that triggered it // flag -> total number of O events matching (not just "at least one")
       const playtimeByWeekday    = [0,0,0,0,0,0,0]; // index 0=Sun..6=Sat (Rome calendar), minutes
       const timingRefs           = {}; // flag -> { sceneId }
       const dayScenes            = {}; // dateKey -> sceneId (first scene seen for that day)
@@ -557,6 +692,7 @@
             const h2 = rp.hour, dow = rp.weekday, mo = rp.month, dy = rp.day, mn = rp.minute;
             const setFlag = (key) => {
               timingCounts[key] = (timingCounts[key]||0) + 1;
+              if (timingDates[key] == null || tms < timingDates[key]) timingDates[key] = tms;
               if (!timing[key]) { timing[key] = true; timingRefs[key] = { sceneId: scene.id }; }
             };
             if (h2>=0&&h2<5)   setFlag("nightOwl");
@@ -858,6 +994,7 @@
       result.timing = timing;
       result.timingRefs = timingRefs;
       result.timingCounts = timingCounts;
+      result.timingDates = timingDates;
       result.playtimeByWeekday = playtimeByWeekday;
       result.playtimeScenesByWeekday = playtimeScenesByWeekday;
       result.birthdayInfo = birthdayInfo;
@@ -1006,6 +1143,7 @@
           const ids = tags.map(t => JSON.stringify(t.id)).join(",");
           const tc = await gqlQuery(`query { findScenes(scene_filter:{o_counter:{value:0,modifier:GREATER_THAN},tags:{value:[${ids}],modifier:INCLUDES}} filter:{per_page:0}) { count } }`);
           result.tagCounts[cfg.id] = tc.findScenes.count || 0;
+          result.tagIdsByCfg[cfg.id] = new Set(tags.map(t => String(t.id)));
           anyTagFound = true;
         } else {
           result.tagCounts[cfg.id] = 0;
@@ -1068,6 +1206,7 @@
       }`);
       const validScenes = (lib.findScenes.scenes||[]).filter(s=>!isNaN(new Date(s.created_at).getTime()));
       const created = validScenes.map(s=>new Date(s.created_at));
+      result.sceneCreatedMs = created.map(d2 => d2.getTime()); // ascending
       if (created.length) {
         const oldest = created.reduce((a,b)=> a<b?a:b);
         result.libraryAgeDays = Math.floor((Date.now() - oldest.getTime()) / 86400000);
@@ -1107,7 +1246,7 @@
     try {
       const perfMs = await gqlQuery(`query {
         findPerformers(filter:{per_page:500, sort:"created_at", direction:ASC}) {
-          performers { id name }
+          performers { id name created_at }
         }
       }`);
       const plist = perfMs.findPerformers.performers || [];
@@ -1168,7 +1307,220 @@
       } catch(e) { result.upcomingBirthday = null; }
     }
 
+    try { result.dates = await computeCompletionDates(result, oScenesForDates); } catch(e) { result.dates = {}; }
     return result;
+  }
+
+  // ── Completion dates ──────────────────────────────────────────────────────
+  // Returns { achievementId: ms } = when the achievement was actually reached
+  // (e.g. the 10th performer's added date, the 100th O's timestamp). Achievements
+  // missing here fall back to the moment they were first noticed.
+  async function computeCompletionDates(d, scenes) {
+    const dates = {};
+    const set = (id, ms) => { if (ms != null && !isNaN(ms)) dates[id] = ms; };
+
+    // Chronological O events + small reusable "when did X reach N" helpers
+    const ev = [];
+    scenes.forEach(sc => (sc.o_history || []).forEach(ts => { const ms = new Date(ts).getTime(); if (!isNaN(ms)) ev.push({ ms, sc }); }));
+    ev.sort((a, b) => a.ms - b.ms);
+    const perfs = sc => sc.performers || [];
+    const durMins = sc => (sc.files && sc.files[0] && sc.files[0].duration) ? sc.files[0].duration / 60 : 0;
+    const age = p => getAge(p.birthdate);
+    const hour = ms => getRomeParts(new Date(ms)).hour;
+    const hist = sc => (sc.o_history || []).map(x => new Date(x).getTime()).filter(x => !isNaN(x)).sort((a, b) => a - b);
+    const firstWhere = pred => { const e = ev.find(x => pred(x.sc, x.ms)); return e ? e.ms : null; };
+    const sceneNth = (pred, n) => { let best = null; scenes.forEach(sc => { if (!pred(sc)) return; const t = hist(sc); if (t.length >= n && (best == null || t[n-1] < best)) best = t[n-1]; }); return best; };
+    const reachDistinct = (valsFn, n) => {
+      const first = new Map();
+      ev.forEach(x => valsFn(x.sc).forEach(v => { if (v != null && v !== "" && !first.has(v)) first.set(v, x.ms); }));
+      const times = [...first.values()].sort((a, b) => a - b);
+      return times.length >= n ? times[n-1] : null;
+    };
+    const entityReach = (entFn, n, distinctScenes) => {
+      const per = new Map(), seen = new Set();
+      ev.forEach(x => entFn(x.sc).forEach(en => {
+        if (distinctScenes) { const k = en + "|" + x.sc.id; if (seen.has(k)) return; seen.add(k); }
+        if (!per.has(en)) per.set(en, []);
+        per.get(en).push(x.ms);
+      }));
+      let best = null;
+      per.forEach(list => { if (list.length >= n && (best == null || list[n-1] < best)) best = list[n-1]; });
+      return best;
+    };
+    const cumulativeReach = (entFn, mins) => {
+      const per = new Map(), seen = new Set();
+      ev.forEach(x => entFn(x.sc).forEach(en => {
+        const k = en + "|" + x.sc.id; if (seen.has(k)) return; seen.add(k);
+        const p = per.get(en) || { sum:0, at:null };
+        p.sum += durMins(x.sc);
+        if (p.at == null && p.sum >= mins) p.at = x.ms;
+        per.set(en, p);
+      }));
+      let best = null;
+      per.forEach(p => { if (p.at != null && (best == null || p.at < best)) best = p.at; });
+      return best;
+    };
+    const rangeReach = (valsFn, n) => {
+      let lo = Infinity, hi = -Infinity;
+      for (const x of ev) { valsFn(x.sc).forEach(v => { if (v < lo) lo = v; if (v > hi) hi = v; }); if (hi - lo >= n) return x.ms; }
+      return null;
+    };
+
+    // ── Library milestones (from "added" dates)
+    const cm = d.sceneCreatedMs || [];
+    [["first-scene",1],["scene-100",100],["scene-1000",1000],["scene-5000",5000]].forEach(([id, n]) => set(id, cm[n-1]));
+    const pm = d.performerMilestones || {};
+    [10, 100, 250, 500].forEach(n => { if (pm[n] && pm[n].created_at) set("performer-" + n, new Date(pm[n].created_at).getTime()); });
+    if (cm.length) { set("library-age-1y", cm[0] + 365*86400000); set("library-age-3y", cm[0] + 1095*86400000); }
+    { const seen = new Set(); cm.forEach(ms => { const dt = new Date(ms); const k = `${dt.getFullYear()}-${dt.getMonth()}`; if (!seen.has(k)) { seen.add(k); if (seen.size === 6) set("active-months-6", ms); if (seen.size === 12) set("active-months-12", ms); } }); }
+    const burst = (keyFn, n) => { const c = new Map(); for (const ms of cm) { const k = keyFn(new Date(ms)); const v = (c.get(k) || 0) + 1; c.set(k, v); if (v >= n) return ms; } return null; };
+    const monthKey = dt => `${dt.getFullYear()}-${dt.getMonth()}`;
+    set("bulk-import-day", burst(dateKey, 50));  set("mega-import-day", burst(dateKey, 200));
+    set("big-month", burst(monthKey, 100));      set("massive-month", burst(monthKey, 500));
+
+    // ── Nth created studio / tag / gallery / image (one tiny query each)
+    const nthCreated = async (field, listKey, n) => {
+      try {
+        const r = await gqlQuery(`query { ${field}(filter:{per_page:1, page:${n}, sort:"created_at", direction:ASC}) { ${listKey} { created_at } } }`);
+        const it = ((r[field] || {})[listKey] || [])[0];
+        return it ? new Date(it.created_at).getTime() : null;
+      } catch (e) { return null; }
+    };
+    await Promise.all([
+      ["studio-25","findStudios","studios",25,d.stats.studio_count], ["studio-100","findStudios","studios",100,d.stats.studio_count],
+      ["tag-50","findTags","tags",50,d.stats.tag_count],             ["tag-200","findTags","tags",200,d.stats.tag_count],
+      ["gallery-25","findGalleries","galleries",25,d.galleryCount],   ["gallery-100","findGalleries","galleries",100,d.galleryCount],
+      ["image-1000","findImages","images",1000,d.stats.image_count],  ["image-5000","findImages","images",5000,d.stats.image_count],
+    ].map(async ([id, f, k, n, have]) => { if ((have || 0) >= n) set(id, await nthCreated(f, k, n)); }));
+
+    // ── Playback (play history)
+    try {
+      const r = await gqlQuery(`query { findScenes(scene_filter:{play_count:{value:0,modifier:GREATER_THAN}} filter:{per_page:-1}) { scenes { id play_history } } }`);
+      const firsts = [], per = [];
+      (r.findScenes.scenes || []).forEach(s => {
+        const t = (s.play_history || []).map(x => new Date(x).getTime()).filter(x => !isNaN(x)).sort((a, b) => a - b);
+        if (t.length) { firsts.push(t[0]); per.push(t); }
+      });
+      firsts.sort((a, b) => a - b);
+      [["watched-1",1],["watched-100",100],["watched-500",500]].forEach(([id, n]) => set(id, firsts[n-1]));
+      [["rewatch-10",10],["rewatch-25",25]].forEach(([id, n]) => { let best = null; per.forEach(t => { if (t.length >= n && (best == null || t[n-1] < best)) best = t[n-1]; }); set(id, best); });
+    } catch (e) {}
+
+    if (ev.length) {
+      // ── O Counter
+      [["o-scenes-10",10],["o-scenes-50",50],["o-scenes-100",100]].forEach(([id, n]) => set(id, reachDistinct(sc => [sc.id], n)));
+      [["o-sum-100",100],["o-sum-500",500],["o-sum-1000",1000]].forEach(([id, n]) => set(id, ev[n-1] ? ev[n-1].ms : null));
+      [["single-3",3],["single-5",5],["single-15",15]].forEach(([id, n]) => set(id, sceneNth(() => true, n)));
+
+      // distinct days / streaks / several O's in one day
+      const dayFirst = new Map(), perDay = new Map();
+      ev.forEach(x => { const k = dateKey(new Date(x.ms)); if (!dayFirst.has(k)) dayFirst.set(k, x.ms); if (!perDay.has(k)) perDay.set(k, []); perDay.get(k).push(x.ms); });
+      const dayKeys = [...dayFirst.keys()];
+      [["o-days-5",5],["o-days-30",30]].forEach(([id, n]) => set(id, dayKeys.length >= n ? dayFirst.get(dayKeys[n-1]) : null));
+      const streakAt = n => { let run = 0; for (let i = 0; i < dayKeys.length; i++) { run = (i > 0 && Date.parse(dayKeys[i]) - Date.parse(dayKeys[i-1]) === 86400000) ? run + 1 : 1; if (run >= n) return dayFirst.get(dayKeys[i]); } return null; };
+      set("o-streak-3", streakAt(3)); set("o-streak-7", streakAt(7));
+      const nthInDay = n => { let best = null; perDay.forEach(a => { if (a.length >= n && (best == null || a[n-1] < best)) best = a[n-1]; }); return best; };
+      set("five-one-day", nthInDay(5)); set("three-of-kind", nthInDay(3));
+
+      // timing patterns
+      const flagDates = { ...(d.timingDates || {}) };
+      let dbl = null, trp = null;
+      scenes.forEach(sc => { const t = hist(sc); for (let i = 1; i < t.length; i++) {
+        if (t[i] - t[i-1] <= 1800000 && (dbl == null || t[i] < dbl)) dbl = t[i];
+        if (i > 1 && t[i] - t[i-2] <= 3600000 && (trp == null || t[i] < trp)) trp = t[i];
+      } });
+      if (dbl != null) flagDates.doubleShot = dbl;
+      if (trp != null) flagDates.tripleShot = trp;
+      const fiveAt = nthInDay(5); if (fiveAt != null) flagDates.fiveInOneDay = fiveAt;
+      const FLAG_IDS = { "night-owl":"nightOwl","early-bird":"earlyBird","lunch-break":"lunchBreak","witching-hour":"witchingHour","double-shot":"doubleShot","triple-shot":"tripleShot",
+        "friday-night":"fridayNight","weekend-warrior":"weekendWarrior","monday-morning":"mondayMorning","siesta":"siesta","holiday-o":"holidayO","nye-countdown":"newYearsCountdown",
+        "valentines":"valentinesO","halloween":"halloweenO","christmas":"christmasO","hump-day":"humpDay","saturday-cartoons":"saturdayCartoons","sunday-scaries":"sundayScaries",
+        "friday-13th":"fridayThe13th","independence-day":"independenceDay","fresh-start":"freshStart","nightcap":"matureNightcap","sunday-matinee":"sundayMatinee","midnight-rebel":"midnightRebellion" };
+      Object.keys(FLAG_IDS).forEach(id => set(id, flagDates[FLAG_IDS[id]]));
+      CHROMA_RULES.concat(HOLIDAY_CHAR_RULES).forEach(r => set(r.id, flagDates[r.flag]));
+      const fd = Object.values(flagDates).sort((a, b) => a - b);
+      set("time-connoisseur", fd[5]); set("chrono-master", fd[11]);
+
+      // playtime patterns (watch time of O'd scenes, by weekday)
+      const wk = [0,0,0,0,0,0,0];
+      const PT = { "weekend-marathon":[w=>w[0]+w[6],600], "friday-night-fever":[w=>w[5],300], "sunday-funday":[w=>w[0],180], "hump-day-hustle":[w=>w[3],180], "monday-marathon":[w=>w[1],300] };
+      const ptDone = {};
+      ev.forEach(x => { wk[getRomeParts(new Date(x.ms)).weekday] += durMins(x.sc); Object.keys(PT).forEach(id => { if (ptDone[id] == null && PT[id][0](wk) >= PT[id][1]) ptDone[id] = x.ms; }); });
+      Object.keys(ptDone).forEach(id => set(id, ptDone[id]));
+
+      // ── Scenes
+      set("ensemble-o", firstWhere(sc => perfs(sc).length >= 5));
+      set("instant-classic", sceneNth(sc => sc.rating100 === 100, 3));
+      set("guilty-pleasure", sceneNth(sc => sc.rating100 != null && sc.rating100 < 50, 3));
+      set("short-sweet", sceneNth(sc => sc.rating100 === 100 && durMins(sc) > 0 && durMins(sc) < 10, 1));
+
+      // ── Performers
+      set("spring-chicken",     firstWhere(sc => perfs(sc).some(p => { const a = age(p); return a !== null && a <= 25; })));
+      set("golden-years",       firstWhere(sc => perfs(sc).some(p => (age(p) || 0) >= 60)));
+      set("antique-collector",  firstWhere(sc => perfs(sc).some(p => (age(p) || 0) >= 70)));
+      const ages = sc => perfs(sc).map(age).filter(a => a !== null);
+      set("generation-gap", rangeReach(ages, 30)); set("anthropologist", rangeReach(ages, 40)); set("time-machine", rangeReach(ages, 50));
+      const hOf = p => Number(p.height_cm) || 0, wOf = p => Number(p.weight) || 0;
+      set("height-range", rangeReach(sc => perfs(sc).map(hOf).filter(v => v > 0), 40));
+      if (d.hasWeight) set("weight-range", rangeReach(sc => perfs(sc).map(wOf).filter(v => v > 0), 40));
+      set("tall-order",    firstWhere(sc => d.heightMedian != null && perfs(sc).some(p => hOf(p) > d.heightMedian)));
+      set("pocket-rocket", firstWhere(sc => d.heightMedian != null && perfs(sc).some(p => hOf(p) > 0 && hOf(p) < d.heightMedian)));
+      const hasArt = p => (p.tattoos || "").trim() || (p.piercings || "").trim();
+      set("body-art", firstWhere(sc => perfs(sc).some(hasArt)));
+      set("defying-gravity", firstWhere(sc => d.heightP90 != null && perfs(sc).some(p => hOf(p) >= d.heightP90)));
+      set("whole-package",   firstWhere(sc => d.heightMedian != null && perfs(sc).some(p => (p.tattoos || "").trim() && (p.piercings || "").trim() && hOf(p) > d.heightMedian)));
+      if (d.hasWeight) {
+        set("heavyweight",   firstWhere(sc => d.weightP90 != null && perfs(sc).some(p => wOf(p) >= d.weightP90)));
+        set("featherweight", firstWhere(sc => d.weightP10 != null && perfs(sc).some(p => wOf(p) > 0 && wOf(p) <= d.weightP10)));
+        set("bantamweight",  firstWhere(sc => perfs(sc).some(p => d.libraryLightestIds && d.libraryLightestIds.has(p.id))));
+        set("super-heavyweight", firstWhere(sc => perfs(sc).some(p => d.libraryHeaviestIds && d.libraryHeaviestIds.has(p.id))));
+      }
+      set("giant",       firstWhere(sc => perfs(sc).some(p => d.libraryTallestIds && d.libraryTallestIds.has(p.id))));
+      set("pocket-size", firstWhere(sc => perfs(sc).some(p => d.libraryShortestIds && d.libraryShortestIds.has(p.id))));
+      const top2 = sc => { const a = ages(sc).sort((x, y) => y - x); return a.length >= 2 ? a[0] + a[1] : 0; };
+      set("age-combo-100", firstWhere(sc => top2(sc) >= 100)); set("age-combo-140", firstWhere(sc => top2(sc) >= 140));
+      set("senior-siesta",  firstWhere((sc, ms) => hour(ms) >= 14 && hour(ms) < 16 && perfs(sc).some(p => (age(p) || 0) >= 60)));
+      set("midlife-crisis", firstWhere((sc, ms) => hour(ms) < 5 && perfs(sc).some(p => { const a = age(p); return a !== null && a >= 40 && a <= 50; })));
+      [["mature-5",5],["mature-15",15],["mature-30",30]].forEach(([id, n]) => set(id, reachDistinct(sc => perfs(sc).filter(p => (age(p) || 0) >= 50).map(p => p.id), n)));
+      [["p-streak-5",5],["p-streak-15",15],["p-streak-30",30]].forEach(([id, n]) => set(id, entityReach(sc => perfs(sc).map(p => p.id), n, true)));
+
+      // ── Stamina
+      set("quickie",   firstWhere(sc => durMins(sc) > 0 && durMins(sc) < 5));
+      set("speed-run", firstWhere(sc => durMins(sc) > 0 && durMins(sc) < 3));
+      set("long-haul", firstWhere((sc, ms) => hour(ms) < 5 && durMins(sc) >= 60));
+      set("marathon",       sceneNth(sc => durMins(sc) >= 90, 3));
+      set("ultra-marathon", sceneNth(sc => durMins(sc) >= 120, 5));
+      const pids = sc => perfs(sc).map(p => p.id);
+      set("deep-dive", cumulativeReach(pids, 60)); set("weekend-binge", cumulativeReach(pids, 180)); set("going-distance", cumulativeReach(pids, 300));
+
+      // ── Studios
+      [["s-streak-10",10],["s-streak-25",25],["s-streak-50",50]].forEach(([id, n]) => set(id, entityReach(sc => sc.studio ? [sc.studio.id] : [], n, false)));
+      [["studio-variety-10",10],["studio-variety-25",25]].forEach(([id, n]) => set(id, reachDistinct(sc => sc.studio ? [sc.studio.id] : [], n)));
+
+      // ── Variety (when the Nth distinct value first showed up)
+      const letters = sc => perfs(sc).map(p => (p.name || "").trim()[0]).map(l => l ? l.toUpperCase() : null).filter(l => l && l >= "A" && l <= "Z");
+      const decade = p => { if (!p.birthdate) return null; const bd = new Date(p.birthdate); return isNaN(bd.getTime()) ? null : Math.floor(bd.getFullYear() / 10) * 10; };
+      const by = f => sc => perfs(sc).map(f);
+      const V = {
+        "alpha-half":[letters,13], "alpha-all":[letters,26],
+        "world-5":[by(p=>p.country),5], "world-10":[by(p=>p.country),10], "world-20":[by(p=>p.country),20],
+        "decades-4":[by(decade),4], "decades-6":[by(decade),6], "decades-8":[by(decade),8],
+        "hair-4":[by(p=>p.hair_color),4], "hair-6":[by(p=>p.hair_color),6],
+        "eyes-4":[by(p=>p.eye_color),4], "eyes-6":[by(p=>p.eye_color),6],
+        "melting-pot":[by(p=>p.ethnicity),3], "cultural-mosaic":[by(p=>p.ethnicity),5],
+        "open-minded":[by(p=>p.gender),2], "full-spectrum":[by(p=>p.gender),4],
+      };
+      Object.keys(V).forEach(id => set(id, reachDistinct(V[id][0], V[id][1])));
+      const wr = [reachDistinct(V["world-5"][0], 5), reachDistinct(V["decades-4"][0], 4), reachDistinct(V["hair-4"][0], 3)];
+      if (wr.every(x => x != null)) set("well-rounded", Math.max(...wr));
+
+      // ── Tag challenges
+      TAG_ACHIEVEMENTS.forEach(cfg => {
+        const ids = (d.tagIdsByCfg || {})[cfg.id];
+        if (ids && ids.size) set(cfg.id, reachDistinct(sc => (sc.tags || []).some(t => ids.has(String(t.id))) ? [sc.id] : [], cfg.target));
+      });
+    }
+    return dates;
   }
 
   // ── O rating achievements (data comes from the stashOratings plugin) ─────
@@ -1222,7 +1574,7 @@
       if (diff <= -20) fades.push(arr[arr.length - 1]);
     });
 
-    return [
+    const list = [
       mk("orate-1",     "🗳️", "First Vote",       "Rate your first O.",                                         o.rated.length, 1,   "easy"),
       mk("orate-25",    "⚖️", "Judge",            "Rate 25 O's.",                                               o.rated.length, 25,  "medium"),
       mk("orate-100",   "🏛️", "Supreme Court",    "Rate 100 O's.",                                              o.rated.length, 100, "hard"),
@@ -1238,6 +1590,22 @@
       mk("orate-cmt-50","📓", "Diarist",          "Write comments on 50 O's.",                                  o.commented.length, 50, "hard"),
       mk("orate-all",   "✅", "Fully Scored",     "Have every logged O rated.",                                 (o.total > 0 && o.unrated === 0) ? 1 : 0, 1, "hard"),
     ];
+    // completion dates: a rating is made at its O's moment, so use that O's timestamp
+    let run = 0, streakAt = null;
+    o.rated.forEach(i => { run = i.rating100 >= 80 ? run + 1 : 0; if (run >= 10 && streakAt == null) streakAt = i.t; });
+    const at = {
+      "orate-1":o.rated[0], "orate-25":o.rated[24], "orate-100":o.rated[99],
+      "orate-10-1":tens[0], "orate-10-10":tens[9], "orate-10-50":tens[49], "orate-harsh":harsh[0],
+      "orate-range": (harsh[0] && loved[0]) ? (harsh[0].t > loved[0].t ? harsh[0] : loved[0]) : null,
+      "orate-cmt-10":o.commented[9], "orate-cmt-50":o.commented[49],
+    };
+    list.forEach(x => {
+      if (at[x.id]) x.completedAt = at[x.id].t;
+      else if (x.id === "orate-streak" && streakAt != null) x.completedAt = streakAt;
+      else if (x.id === "orate-grows" && grows.length) x.completedAt = Math.min(...grows.map(i => i.t));
+      else if (x.id === "orate-fades" && fades.length) x.completedAt = Math.min(...fades.map(i => i.t));
+    });
+    return list;
   }
 
   // ── Achievement definitions ───────────────────────────────────────────────
@@ -1611,6 +1979,10 @@
       add({ id:"changing-guard",  category:"Legacy", icon:"🔄", name:"Changing of the Guard",description:"This year's top-O'd performer differs from last year's.",             current:d.guardChanged?1:0, target:1, tier:"easy",   performerPopup:true, performerId:d.guardChanged?d.guardChanged.performerId:null, performerName:d.guardChanged?d.guardChanged.performerName:null });
     }
 
+    // real completion dates (see computeCompletionDates), when known
+    const realDates = d.dates || {};
+    a.forEach(x => { if (realDates[x.id] != null) x.completedAt = realDates[x.id]; });
+
     a.push(...getORatingAchievements(d));
 
     return a;
@@ -1874,7 +2246,7 @@
     );
   }
 
-  function AchievementCard({ a, unlocked, onOpenScene, onOpenDays, onOpenPerformer, onOpenPerformerList, onOpenChain, onOpenSceneList }) {
+  function AchievementCard({ a, unlocked, unlockedAt, onOpenScene, onOpenDays, onOpenPerformer, onOpenPerformerList, onOpenChain, onOpenSceneList }) {
     const { Link } = PluginApi.libraries.ReactRouterDOM;
 
     const hasDays = a.days && a.days.length > 0;
@@ -1909,6 +2281,7 @@
           unlocked && h("span", { className:"stash-plus-badge" }, "Unlocked")
         ),
         h("div", { className:"stash-plus-card-desc" }, a.description),
+        unlockedAt > 0 && h("div", { className:"stash-plus-progress-label", style:{ marginBottom:"0.4rem" } }, `🗓️ Completed ${dateKey(new Date(unlockedAt))}`),
         a.performerId && !hasPerformerPopup && h("div", { className:"stash-plus-card-link" },
           h(Link, { to:`/performers/${a.performerId}`, onClick:e=>e.stopPropagation() }, `🎈 ${a.performerName}`)
         ),
@@ -2044,7 +2417,7 @@
   async function fetchOScenesForRanking() {
     const data = await gqlQuery(`query {
       findScenes(scene_filter:{o_counter:{value:0,modifier:GREATER_THAN}} filter:{per_page:-1}) {
-        scenes { id title o_history o_counter rating100 paths { screenshot } files { duration } performers { id name image_path favorite } studio { id name image_path } }
+        scenes { id title o_history o_counter rating100 paths { screenshot } files { duration } tags { id } performers { id name image_path favorite ${PERF_FILTER_FIELDS} } studio { id name image_path } }
       }
     }`);
     return data.findScenes.scenes;
@@ -2177,7 +2550,7 @@
     );
   }
 
-  function FullRanking({ performers, onSelectPerformer }) {
+  function FullRanking({ performers, onSelectPerformer, noun }) {
     const [expanded, setExpanded] = useState(false);
     const shown = expanded ? performers : performers.slice(0, 10);
     return h("div", { className:"podium-full-list" },
@@ -2196,7 +2569,7 @@
         )
       ),
       performers.length > 10 && h("button", { className:"podium-show-more", onClick:()=>setExpanded(!expanded) },
-        expanded ? "Show less ▲" : `Show all ${performers.length} performers ▼`
+        expanded ? "Show less ▲" : `Show all ${performers.length} ${noun || "performers"} ▼`
       )
     );
   }
@@ -2299,12 +2672,8 @@
       if (!query || query.trim().length < 2) { setResults([]); return; }
       let cancelled = false;
       const t = setTimeout(() => {
-        gqlQuery(`query($q: String!) {
-          findPerformers(performer_filter:{name:{value:$q, modifier:INCLUDES}} filter:{per_page:8}) {
-            performers { id name image_path }
-          }
-        }`, { q: query.trim() })
-          .then(d => { if (!cancelled) setResults(d.findPerformers.performers || []); })
+        searchPerformersBestMatch(query, 8)
+          .then(list => { if (!cancelled) setResults(list); })
           .catch(() => { if (!cancelled) setResults([]); });
       }, 300);
       return () => { cancelled = true; clearTimeout(t); };
@@ -2316,11 +2685,11 @@
       setState({ loading:true, error:null, months:[], heat:null }); setHeatYear(null);
       gqlQuery(`query($id: ID!) {
         findScenes(scene_filter:{performers:{value:[$id], modifier:INCLUDES}} filter:{per_page:-1}) {
-          scenes { id title created_at o_history o_counter rating100 files { duration } paths { screenshot } performers { id name } }
+          scenes { id title created_at o_history o_counter rating100 files { duration } paths { screenshot } tags { id } performers { id name ${PERF_FILTER_FIELDS} } }
         }
       }`, { id: selected.id }).then(data => {
         if (cancelled) return;
-        const scenes = data.findScenes.scenes || [];
+        const scenes = applySettings(data.findScenes.scenes || []);
         const monthMap = new Map();
         const ensure = k => { if (!monthMap.has(k)) monthMap.set(k, { month:k, oCount:0, playMins:0, ratingSum:0, ratingCount:0, oScenes:[], addedScenes:[] }); return monthMap.get(k); };
         scenes.forEach(s => {
@@ -2569,11 +2938,11 @@
 
       gqlQuery(`query {
         findScenes(filter:{per_page:-1}) {
-          scenes { id title created_at o_history o_counter rating100 files { duration } paths { screenshot } performers { id name favorite image_path hair_color ethnicity country height_cm weight birthdate } }
+          scenes { id title created_at o_history o_counter rating100 files { duration } paths { screenshot } tags { id } performers { id name favorite image_path hair_color ethnicity country height_cm weight birthdate gender } }
         }
       }`).then(data => {
         if (cancelled) return;
-        const scenes = data.findScenes.scenes || [];
+        const scenes = applySettings(data.findScenes.scenes || []);
         const sceneInfo = s => ({
           id: s.id, title: s.title || "(Untitled scene)",
           screenshot: (s.paths && s.paths.screenshot) || null,
@@ -3003,7 +3372,7 @@
 
       async function loadPodium() {
         try {
-          const scenes = await fetchOScenesForRanking();
+          const scenes = applySettings(await fetchOScenesForRanking());
           const scope = year === "all" ? { type:"all" } : { type:"year", value:year };
           const scored = buildRanking(scenes, scope, scene => scene.performers || []);
           if (!cancelled) setPs({ loading:false, error:null, performers:scored });
@@ -3072,7 +3441,7 @@
 
       async function loadPodium() {
         try {
-          const scenes = await fetchOScenesForRanking();
+          const scenes = applySettings(await fetchOScenesForRanking());
           const scored = buildRanking(scenes, { type:"month", value:month }, scene => scene.performers || []);
           let dd = buildODayData(scenes);
           const maps = await loadORatingMaps();
@@ -3190,7 +3559,7 @@
       !ps.loading && !ps.error && ps.studios.length===0 && h("div", { className:"stash-plus-loading" }, `No O's logged ${scopeType==="all"?"yet":"in "+periodLabel}.`),
       !ps.loading && ps.studios.length>0 && h(React.Fragment, null,
         h(PodiumBlock, { performers:ps.studios, onSelectPerformer:setSelectedStudio }),
-        ps.studios.length>3 && h(FullRanking, { performers:ps.studios, onSelectPerformer:setSelectedStudio })
+        ps.studios.length>3 && h(FullRanking, { performers:ps.studios, onSelectPerformer:setSelectedStudio, noun:"studios" })
       ),
       selectedStudio && h(PerformerScoreModal, { performer:selectedStudio, onClose:()=>setSelectedStudio(null), onSelectScene:setSelectedSceneId, entityRoute:"/studios", entityLabel:"studio", periodLabel: scopeType==="all" ? "all time" : scopeType==="year" ? "this year" : "this month" }),
       selectedSceneId && h(SceneInfoModal, { sceneId:selectedSceneId, onClose:()=>setSelectedSceneId(null) })
@@ -3262,17 +3631,17 @@
           const [watchedData, candidateData] = await Promise.all([
             gqlQuery(`query {
               findScenes(scene_filter:{o_counter:{value:0,modifier:GREATER_THAN}} filter:{per_page:-1}) {
-                scenes { id o_counter rating100 performers { id name } studio { id name } files { duration } }
+                scenes { id o_counter rating100 tags { id } performers { id name ${PERF_FILTER_FIELDS} } studio { id name } files { duration } }
               }
             }`),
             gqlQuery(`query {
               findScenes(scene_filter:{o_counter:{value:0,modifier:${suggestRewatches ? "GREATER_THAN" : "EQUALS"}}} filter:{per_page:-1}) {
-                scenes { id title rating100 o_counter performers { id name } tags { id name } studio { id name } files { duration } paths { screenshot } }
+                scenes { id title rating100 o_counter performers { id name ${PERF_FILTER_FIELDS} } tags { id name } studio { id name } files { duration } paths { screenshot } }
               }
             }`),
           ]);
-          const watched = watchedData.findScenes.scenes || [];
-          const candidates = candidateData.findScenes.scenes || [];
+          const watched = applySettings(watchedData.findScenes.scenes || []);
+          const candidates = applySettings(candidateData.findScenes.scenes || []);
 
           if (!watched.length) { if (!cancelled) setState({ loading:false, error:null, data:{ noHistory:true } }); return; }
 
@@ -3622,6 +3991,90 @@
     );
   }
 
+  // ── Settings tab ──────────────────────────────────────────────────────────
+  function DualRange({ def, value, onChange }) {
+    const [lo, hi] = value;
+    const any = lo <= def.min && hi >= def.max;
+    const text = any ? "Any" : `${lo <= def.min ? "up to " : lo + " – "}${hi >= def.max ? (lo <= def.min ? "any" : def.max + "+") : hi}${def.unit}`.replace("up to any", "Any");
+    return h("div", { style:{ marginBottom:"0.9rem" } },
+      h("div", { style:{ fontSize:"0.85rem", marginBottom:"0.15rem" } }, h("strong", null, def.label + ": "), text),
+      h("div", { className:"stash-plus-dual" },
+        h("input", { type:"range", min:def.min, max:def.max, value:lo, style:{ zIndex: lo > (def.min + def.max) / 2 ? 5 : 3 }, onChange:e => onChange([Math.min(Number(e.target.value), hi), hi]) }),
+        h("input", { type:"range", min:def.min, max:def.max, value:hi, style:{ zIndex:4 }, onChange:e => onChange([lo, Math.max(Number(e.target.value), lo)]) })
+      )
+    );
+  }
+
+  function SettingsPage() {
+    const [settings, setSettings] = useState(getSettings);
+    const [tagQuery, setTagQuery] = useState("");
+    const [tagResults, setTagResults] = useState([]);
+    const update = next => { setSettings(next); saveSettings(next); };
+
+    useEffect(() => {
+      if (!tagQuery || tagQuery.trim().length < 2) { setTagResults([]); return; }
+      let cancelled = false;
+      const t = setTimeout(() => {
+        gqlQuery(`query($q: String!) {
+          findTags(tag_filter:{name:{value:$q, modifier:INCLUDES}} filter:{per_page:10}) { tags { id name } }
+        }`, { q: tagQuery.trim() })
+          .then(d => { if (!cancelled) setTagResults((d.findTags.tags || []).filter(t2 => !settings.excludedTags.some(x => x.id === t2.id))); })
+          .catch(() => { if (!cancelled) setTagResults([]); });
+      }, 300);
+      return () => { cancelled = true; clearTimeout(t); };
+    }, [tagQuery, settings.excludedTags]);
+
+    const toggleHair = key => update({ ...settings, hairs: settings.hairs.includes(key) ? settings.hairs.filter(k => k !== key) : [...settings.hairs, key] });
+    const setRange = (k, v) => update({ ...settings, [k + "Range"]: v });
+    const toggleGender = key => update({ ...settings, genders: settings.genders.includes(key) ? settings.genders.filter(g => g !== key) : [...settings.genders, key] });
+    const chip = (label, onClick, title) => h("span", { onClick, title, style:{ fontSize:"0.8rem", background:"rgba(255,200,80,0.15)", color:"#ffc850", border:"1px solid rgba(255,200,80,0.4)", borderRadius:"6px", padding:"0.25rem 0.6rem", cursor:"pointer" } }, label);
+
+    return h("div", null,
+      h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "These settings apply to Stats, Performer of the Year, Monthly Breakdown and For You. Reopen those tabs to see the changes."),
+      h("div", { className:"stash-plus-category" },
+        h("h2", null, "🚻 Performer genders"),
+        h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "Only performers matching all the filters below are counted. While a performer filter is active, scenes with no matching performer are left out."),
+        h("div", { style:{ display:"flex", flexWrap:"wrap", gap:"1rem", marginBottom:"0.6rem" } },
+          GENDER_OPTIONS.map(g => h("label", { key:g.key, style:{ display:"flex", alignItems:"center", gap:"0.35rem", cursor:"pointer", fontSize:"0.9rem" } },
+            h("input", { type:"checkbox", checked:settings.genders.includes(g.key), onChange:()=>toggleGender(g.key) }), g.label))
+        ),
+        h("button", { className:"podium-year-select", onClick:()=>update({ ...settings, genders:GENDER_OPTIONS.map(g=>g.key) }) }, "Select all"),
+        settings.genders.length === 0 && h("div", { className:"stash-plus-error" }, "No gender selected: those pages will be empty.")
+      ),
+      h("div", { className:"stash-plus-category" },
+        h("h2", null, "💇 Hair colour"),
+        h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "Similar shades are grouped together (Brunette includes brown, chestnut, dark brown…)."),
+        h("div", { style:{ display:"flex", flexWrap:"wrap", gap:"1rem", marginBottom:"0.6rem" } },
+          HAIR_GROUPS.map(g => h("label", { key:g.key, style:{ display:"flex", alignItems:"center", gap:"0.35rem", cursor:"pointer", fontSize:"0.9rem" } },
+            h("input", { type:"checkbox", checked:settings.hairs.includes(g.key), onChange:()=>toggleHair(g.key) }), g.label))
+        ),
+        h("button", { className:"podium-year-select", onClick:()=>update({ ...settings, hairs:HAIR_GROUPS.map(g=>g.key) }) }, "Select all")
+      ),
+      h("div", { className:"stash-plus-category" },
+        h("h2", null, "📏 Age, height & weight"),
+        h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "Drag both ends of a slider to set the range. Leaving an end at its limit means no limit on that side."),
+        h(DualRange, { def:RANGE_DEFS.age,    value:settings.ageRange,    onChange:v=>setRange("age", v) }),
+        h(DualRange, { def:RANGE_DEFS.height, value:settings.heightRange, onChange:v=>setRange("height", v) }),
+        h(DualRange, { def:RANGE_DEFS.weight, value:settings.weightRange, onChange:v=>setRange("weight", v) }),
+        h("label", { style:{ display:"flex", alignItems:"center", gap:"0.35rem", cursor:"pointer", fontSize:"0.9rem" } },
+          h("input", { type:"checkbox", checked:settings.includeUnknown, onChange:e=>update({ ...settings, includeUnknown:e.target.checked }) }),
+          "Keep performers whose age / height / weight is missing"
+        )
+      ),
+      h("div", { className:"stash-plus-category" },
+        h("h2", null, "🚫 Excluded tags"),
+        h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "Scenes with any of these tags are ignored."),
+        settings.excludedTags.length > 0 && h("div", { style:{ display:"flex", flexWrap:"wrap", gap:"0.4rem", marginBottom:"0.6rem" } },
+          settings.excludedTags.map(t => chip(`🏷️ ${t.name} ✕`, ()=>update({ ...settings, excludedTags:settings.excludedTags.filter(x=>x.id!==t.id) }), "Remove"))
+        ),
+        h("input", { type:"text", value:tagQuery, placeholder:"Search tags to exclude…", onChange:e=>setTagQuery(e.target.value), className:"podium-year-select", style:{ width:"100%", maxWidth:"320px" } }),
+        tagResults.length > 0 && h("div", { style:{ marginTop:"0.5rem" } },
+          tagResults.map(t => h("div", { key:t.id, className:"podium-row", onClick:()=>{ update({ ...settings, excludedTags:[...settings.excludedTags, { id:t.id, name:t.name }] }); setTagQuery(""); setTagResults([]); } }, h("span", null, `🏷️ ${t.name}`)))
+        )
+      )
+    );
+  }
+
   // ── Main page ─────────────────────────────────────────────────────────────
   function StashPlusPage() {
     const [tab, setTab]     = useState("achievements");
@@ -3633,7 +4086,8 @@
     const [modalChain, setModalChain] = useState(null);
     const [modalSceneList, setModalSceneList] = useState(null);
     const [filter, setFilter] = useState("all");
-    const [sortMode, setSortMode] = useState("default"); // "default" | "recent"
+    const [sortMode, setSortMode] = useState("default"); // "default" | "recent" | "date"
+    const [dateDir, setDateDir] = useState("desc");      // completed-date order: "desc" = newest first
 
     useEffect(() => {
       let cancelled = false;
@@ -3651,7 +4105,8 @@
       h("button", { className:"stash-plus-tab"+(tab==="studios"?" active":""),      onClick:()=>setTab("studios") },      "🏢 Studios"),
       h("button", { className:"stash-plus-tab"+(tab==="foryou"?" active":""),       onClick:()=>setTab("foryou") },       "🔮 For You"),
       h("button", { className:"stash-plus-tab"+(tab==="stats"?" active":""),        onClick:()=>setTab("stats") },        "📈 Stats"),
-      h("button", { className:"stash-plus-tab"+(tab==="oratings"?" active":""),   onClick:()=>setTab("oratings") },   "⭐ O Ratings")
+      h("button", { className:"stash-plus-tab"+(tab==="oratings"?" active":""),   onClick:()=>setTab("oratings") },   "⭐ O Ratings"),
+      h("button", { className:"stash-plus-tab"+(tab==="settings"?" active":""),   onClick:()=>setTab("settings") },   "⚙️ Settings")
     );
 
     if (tab === "podium") return h("div", { className:"stash-plus-page" }, tabBar, h(PerformerPodium, null));
@@ -3659,6 +4114,7 @@
     if (tab === "studios") return h("div", { className:"stash-plus-page" }, tabBar, h(StudioPodium, null));
     if (tab === "foryou")  return h("div", { className:"stash-plus-page" }, tabBar, h(RecommendationsPage, null));
     if (tab === "stats")   return h("div", { className:"stash-plus-page" }, tabBar, h(StatsPage, null));
+    if (tab === "settings") return h("div", { className:"stash-plus-page" }, tabBar, h(SettingsPage, null));
     if (tab === "oratings") return h("div", { className:"stash-plus-page" }, tabBar, h(ORatingsPage, null));
 
     if (state.loading) return h("div", { className:"stash-plus-page" }, tabBar, h("div", { className:"stash-plus-loading" }, "Calculating your progress…"));
@@ -3666,39 +4122,31 @@
 
     const achievements = getAchievements(state.data);
 
-    // unlockedMap: { [achievementId]: timestampMs }. Reads may encounter the old
-    // array format from earlier plugin versions, so migrate it transparently.
-    let unlockedMap = {};
-    try {
-      const raw = JSON.parse(localStorage.getItem(STORAGE_KEY)||"{}");
-      if (Array.isArray(raw)) raw.forEach(id => { unlockedMap[id] = 0; }); // legacy format, no timestamp known
-      else if (raw && typeof raw === "object") unlockedMap = raw;
-    } catch(e) {}
-    const newlyUnlocked = achievements.filter(a => a.current>=a.target && !(a.id in unlockedMap)).map(a=>a.id);
-    if (newlyUnlocked.length) {
-      const now = Date.now();
-      newlyUnlocked.forEach(id => { unlockedMap[id] = now; });
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(unlockedMap)); } catch(e) {}
-    }
+    // unlockedMap: { [achievementId]: timestampMs } (0 = unlocked, date unknown).
+    // syncUnlocks also records new unlocks and pops up the toast.
+    const unlockedMap = syncUnlocks(achievements);
 
     const total      = achievements.length;
-    const unlocked   = achievements.filter(a => (a.id in unlockedMap) || a.current>=a.target).length;
+    const unlocked   = achievements.filter(a => a.current>=a.target).length;
     const pct        = total > 0 ? Math.round((unlocked/total)*100) : 0;
     const baseVisible = filter==="completed" ? achievements.filter(a=>a.current>=a.target)
                       : filter==="missing"   ? achievements.filter(a=>a.current<a.target)
                       : achievements;
-    // "Recently Unlocked" flattens category grouping and sorts unlocked
-    // achievements newest-first (unknown/legacy timestamps sort last among unlocked),
-    // followed by everything still locked.
+    // "Recently Unlocked" = everything unlocked in the last 7 days, newest first.
+    const WEEK_MS = 7*86400000;
     const visible = sortMode==="recent"
+      ? baseVisible.filter(a => a.current>=a.target && (unlockedMap[a.id]||0) >= Date.now()-WEEK_MS).sort((x,y) => unlockedMap[y.id]-unlockedMap[x.id])
+      : sortMode==="date"
+      // completed-date order: dated unlocks first, then unlocked with unknown date, then locked
       ? [...baseVisible].sort((x,y) => {
-          const xu = x.id in unlockedMap, yu = y.id in unlockedMap;
-          if (xu && yu) return (unlockedMap[y.id]||0) - (unlockedMap[x.id]||0);
-          if (xu !== yu) return xu ? -1 : 1;
+          const rank = a => (a.current<a.target || !(a.id in unlockedMap)) ? 2 : (unlockedMap[a.id] > 0 ? 0 : 1);
+          const rx = rank(x), ry = rank(y);
+          if (rx !== ry) return rx - ry;
+          if (rx === 0) return dateDir==="asc" ? unlockedMap[x.id]-unlockedMap[y.id] : unlockedMap[y.id]-unlockedMap[x.id];
           return 0;
         })
       : baseVisible;
-    const categories = sortMode==="recent" ? ["Recently Unlocked"] : [...new Set(visible.map(a=>a.category))];
+    const categories = sortMode==="recent" ? ["Unlocked in the last 7 days"] : sortMode==="date" ? ["By completion date"] : [...new Set(visible.map(a=>a.category))];
 
     const filterBtn = (key, label) => h("button", {
       onClick: () => setFilter(filter===key ? "all" : key),
@@ -3727,15 +4175,34 @@
               color: "inherit", borderRadius: "6px", padding: "0.4rem 0.9rem", cursor: "pointer",
               fontSize: "0.85rem", marginRight: "0.5rem",
             },
-          }, "🕒 Recently Unlocked")
+          }, "🕒 Recently Unlocked (7 days)"),
+          h("button", {
+            onClick: () => setSortMode(sortMode==="date" ? "default" : "date"),
+            style: {
+              background: sortMode==="date" ? "rgba(255,200,80,0.15)" : "rgba(255,255,255,0.06)",
+              border: "1px solid " + (sortMode==="date" ? "rgba(255,200,80,0.5)" : "rgba(255,255,255,0.12)"),
+              color: "inherit", borderRadius: "6px", padding: "0.4rem 0.9rem", cursor: "pointer",
+              fontSize: "0.85rem", marginRight: "0.5rem",
+            },
+          }, "📅 By Completion Date"),
+          sortMode==="date" && h("button", {
+            onClick: () => setDateDir(dateDir==="desc" ? "asc" : "desc"),
+            title: "Toggle order",
+            style: {
+              background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)",
+              color: "inherit", borderRadius: "6px", padding: "0.4rem 0.9rem", cursor: "pointer",
+              fontSize: "0.85rem", marginRight: "0.5rem",
+            },
+          }, dateDir==="desc" ? "⬇ Newest first" : "⬆ Oldest first")
         )
       ),
-      categories.map(cat =>
+      sortMode==="recent" && visible.length===0 && h("div", { className:"stash-plus-loading" }, "Nothing unlocked in the last 7 days."),
+      sortMode==="recent" && visible.length===0 ? null : categories.map(cat =>
         h("div", { key:cat, className:"stash-plus-category" },
           h("h2", null, cat),
           h("div", { className:"stash-plus-grid" },
-            visible.filter(a=>a.category===cat).map(a =>
-              h(AchievementCard, { key:a.id, a, unlocked:a.current>=a.target, onOpenScene:setModalSceneId, onOpenDays:setModalDays, onOpenPerformer:setModalPerformerId, onOpenPerformerList:setModalPerformerList, onOpenChain:setModalChain, onOpenSceneList:setModalSceneList })
+            (sortMode!=="default" ? visible : visible.filter(a=>a.category===cat)).map(a =>
+              h(AchievementCard, { key:a.id, a, unlocked:a.current>=a.target, unlockedAt:a.current>=a.target ? unlockedMap[a.id] : undefined, onOpenScene:setModalSceneId, onOpenDays:setModalDays, onOpenPerformer:setModalPerformerId, onOpenPerformerList:setModalPerformerList, onOpenChain:setModalChain, onOpenSceneList:setModalSceneList })
             )
           )
         )
@@ -3748,6 +4215,134 @@
       modalPerformerId && h(PerformerInfoModal, { performerId:modalPerformerId, onClose:()=>setModalPerformerId(null) })
     );
   }
+
+  // ── Unlock tracking, toast popup & background checker ────────────────────
+  const UNLOCK_INIT_KEY = "stashPlusUnlockedInit";
+
+  function readUnlockedMap() {
+    const map = {};
+    try {
+      const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+      if (Array.isArray(raw)) raw.forEach(id => { map[id] = 0; }); // legacy format
+      else if (raw && typeof raw === "object") Object.assign(map, raw);
+    } catch (e) {}
+    return map;
+  }
+
+  // Records newly completed achievements (with a timestamp) and shows a toast
+  // for each. The very first run on a browser with no saved data seeds silently
+  // (date unknown) so existing progress doesn't flood the screen.
+  function syncUnlocks(achievements) {
+    const map = readUnlockedMap();
+    let hadInit = true;
+    try { hadInit = localStorage.getItem(UNLOCK_INIT_KEY) !== null; } catch (e) {}
+    const firstRun = !hadInit && Object.keys(map).length === 0;
+    const fresh = achievements.filter(a => a.current >= a.target && !(a.id in map));
+    const now = Date.now();
+    fresh.forEach(a => { map[a.id] = firstRun ? 0 : now; });
+    // Where the real completion date is known (a.completedAt), it wins over "when we noticed".
+    let changed = fresh.length > 0;
+    achievements.forEach(a => {
+      if (a.current >= a.target && a.completedAt != null && map[a.id] !== a.completedAt) { map[a.id] = a.completedAt; changed = true; }
+    });
+    try {
+      if (changed) localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+      localStorage.setItem(UNLOCK_INIT_KEY, "1");
+    } catch (e) {}
+    if (fresh.length && !firstRun) showAchievementToasts(fresh);
+    return map;
+  }
+
+  // Achievements that are recorded as unlocked but whose conditions are no longer
+  // met (e.g. the O that earned it was deleted). Event-based ones that depend on
+  // "today" are exempt, since they can't be re-checked later.
+  const REVOKE_EXEMPT = new Set(["birthday-o", "changing-guard"]);
+  function revocableIds(achievements) {
+    const map = readUnlockedMap();
+    return achievements.filter(a => a.current < a.target && a.id in map && !REVOKE_EXEMPT.has(a.id)).map(a => a.id);
+  }
+  function revokeUnlocks(ids) {
+    const map = readUnlockedMap();
+    let changed = false;
+    ids.forEach(id => { if (id in map) { delete map[id]; changed = true; } });
+    if (changed) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(map)); } catch (e) {} }
+  }
+
+  function showAchievementToasts(list) {
+    try {
+      let box = document.getElementById("stash-plus-toasts");
+      if (!box) { box = document.createElement("div"); box.id = "stash-plus-toasts"; box.className = "stash-plus-toasts"; document.body.appendChild(box); }
+      const MAX = 4;
+      const shown = list.length > MAX ? list.slice(0, MAX - 1) : list;
+      const extra = list.length - shown.length;
+      const make = (icon, name, desc) => {
+        const el = document.createElement("div");
+        el.className = "stash-plus-toast";
+        const add = (cls, text, tag) => { const n = document.createElement(tag || "div"); n.className = cls; n.textContent = text; return n; };
+        const body = document.createElement("div");
+        body.className = "stash-plus-toast-body";
+        body.append(add("stash-plus-toast-head", "🏆 Achievement unlocked"), add("stash-plus-toast-name", name));
+        if (desc) body.append(add("stash-plus-toast-desc", desc));
+        const close = add("stash-plus-toast-close", "✕", "button");
+        close.type = "button"; close.title = "Close";
+        const remove = () => { clearTimeout(timer); el.remove(); };
+        const timer = setTimeout(remove, 5000);
+        close.onclick = remove;
+        el.append(add("stash-plus-toast-icon", icon), body, close);
+        box.appendChild(el);
+      };
+      shown.forEach(a => make(a.icon, a.name, a.description));
+      if (extra > 0) make("🎉", `+${extra} more achievements`, "Open Stash+ to see them all.");
+    } catch (e) {}
+  }
+
+  // Runs in the background on every Stash page (not just /stash-plus) so the
+  // toast shows up wherever you are: shortly after load, after relevant
+  // mutations (O logged, scene/performer changes…), and every 15 minutes.
+  let bgRunning = false, bgPending = false, bgPendingDelay = Infinity, bgTimer = null, bgSuspects = new Set();
+  async function backgroundAchievementCheck() {
+    if (bgRunning) { bgPending = true; return; }
+    bgRunning = true;
+    try {
+      const data = await loadAllData();
+      data.oRatings = await loadORatingStats();
+      const list = getAchievements(data);
+      syncUnlocks(list);
+      // Revoke achievements whose conditions no longer hold, but only once a second
+      // check (15s later) agrees, so a failed query can't wrongly take one away.
+      const failing = revocableIds(list);
+      const confirmed = failing.filter(id => bgSuspects.has(id));
+      if (confirmed.length) revokeUnlocks(confirmed);
+      bgSuspects = new Set(failing.filter(id => !bgSuspects.has(id)));
+      if (bgSuspects.size) scheduleBackgroundCheck(15000);
+    } catch (e) {
+    } finally {
+      bgRunning = false;
+      if (bgPending) { const dl = bgPendingDelay; bgPending = false; bgPendingDelay = Infinity; scheduleBackgroundCheck(dl); }
+    }
+  }
+  function scheduleBackgroundCheck(delay) {
+    // a run already in progress may have started before this change was saved: rerun right after it
+    if (bgRunning) { bgPending = true; bgPendingDelay = Math.min(bgPendingDelay, delay); return; }
+    clearTimeout(bgTimer); bgTimer = setTimeout(backgroundAchievementCheck, delay); }
+
+  const MUTATION_RE = /sceneAddO|sceneIncrementO|sceneDeleteO|sceneDecrementO|sceneResetO|sceneUpdate|bulkSceneUpdate|sceneAddPlay|performerCreate|performerUpdate|studioCreate|tagCreate|configurePlugin/;
+  const O_MUTATION_RE = /sceneAddO|sceneIncrementO|sceneDeleteO|sceneDecrementO|sceneResetO/;
+  const origFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const p = origFetch.apply(this, arguments);
+    try {
+      const body = init && typeof init.body === "string" ? init.body : null;
+      if (body && body.indexOf("mutation") >= 0) {
+        // an O added or removed: check immediately, as soon as the server has saved it
+        if (O_MUTATION_RE.test(body)) p.then(() => scheduleBackgroundCheck(0)).catch(() => {});
+        else if (MUTATION_RE.test(body)) scheduleBackgroundCheck(8000);
+      }
+    } catch (e) {}
+    return p;
+  };
+  if (!/\/stash-plus/.test(location.pathname)) scheduleBackgroundCheck(5000);
+  setInterval(() => { if (!document.hidden) scheduleBackgroundCheck(0); }, 15 * 60 * 1000);
 
   // ── Register ──────────────────────────────────────────────────────────────
   PluginApi.register.route("/stash-plus", StashPlusPage);
