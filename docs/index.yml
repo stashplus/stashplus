@@ -3,6 +3,14 @@
   metadata:
     description: "Achievements, rankings, stats and recommendations for your Stash library — performers, scenes, ratings, O-counts, and more."
   version: "1.2.1"
-  date: 2026-11-27 12:23:09
+  date: 2026-11-27 12:32:38
   path: stashPlus.zip
   sha256: c20c23c228b09d0434b53c760c64b79c5703ffd17db7223b02dc943829d45c61
+- id: stashOratings
+  name: "Stash+ O Ratings"
+  metadata:
+    description: "Rate and comment on every individual O. Companion plugin for Stash+."
+  version: "1.0.0"
+  date: 2026-11-27 12:32:38
+  path: stashOratings.zip
+  sha256: 99dc74b1b6394e59609f37942a04c173b0e155a1e096c6b161368629b8cb6768
