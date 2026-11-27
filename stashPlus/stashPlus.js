@@ -169,11 +169,27 @@
   // ── Helpers ───────────────────────────────────────────────────────────────
   // Returns { year, month (0-11), day, hour, minute, weekday (0=Sun..6=Sat) } for a
   // given Date/timestamp, as observed in the Europe/Rome timezone.
+  const TZ_KEY = "stashPlusTimezone";
+  let _tz = null, _fmt = null, _fmtTZ = null;
+  function getTZ() {
+    if (!_tz) { try { _tz = localStorage.getItem(TZ_KEY) || "Europe/Rome"; } catch (e) { _tz = "Europe/Rome"; } }
+    return _tz;
+  }
+  function setTZ(tz) { _tz = tz; try { localStorage.setItem(TZ_KEY, tz); } catch (e) {} }
+  const TIMEZONES = (() => {
+    let l; try { l = Intl.supportedValuesOf("timeZone"); } catch (e) { l = ["Europe/Rome","Europe/London","America/New_York","America/Los_Angeles","Asia/Tokyo"]; }
+    if (!l.includes("UTC")) l = l.concat(["UTC"]);
+    return l;
+  })();
+
   function getRomeParts(date) {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: "Europe/Rome", year: "numeric", month: "2-digit", day: "2-digit",
-      hour: "2-digit", minute: "2-digit", hour12: false, weekday: "short"
-    }).formatToParts(date);
+    const tz = getTZ();
+    if (!_fmt || _fmtTZ !== tz) {
+      _fmt = new Intl.DateTimeFormat("en-US", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hour12: false, weekday: "short" });
+      _fmtTZ = tz;
+    }
+    const parts = _fmt.formatToParts(date);
     const map = {};
     for (const p of parts) map[p.type] = p.value;
     const WEEKDAYS = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
@@ -207,6 +223,8 @@
     const p = getRomeParts(d);
     return `${p.year}-${String(p.month+1).padStart(2,"0")}-${String(p.day).padStart(2,"0")}`;
   }
+
+  const monthKeyOf = d => { const p = getRomeParts(d); return `${p.year}-${String(p.month+1).padStart(2,"0")}`; };
 
   function longestStreak(dayKeys) {
     const ms = Array.from(dayKeys).map(k => { const [y,m,d] = k.split("-").map(Number); return new Date(y,m-1,d).getTime(); }).sort((a,b)=>a-b);
@@ -429,7 +447,7 @@
 
       async function tryFetch(withHistory, withWeight) {
         const perfFields = withWeight ? PERF_FIELDS_W : PERF_FIELDS_NW;
-        const sceneFields = withHistory ? "id title o_counter o_history rating100 tags { id } paths { screenshot }" : "id title o_counter rating100 tags { id } paths { screenshot }";
+        const sceneFields = withHistory ? "id title o_counter o_history rating100 play_duration play_history tags { id } paths { screenshot }" : "id title o_counter rating100 play_duration play_history tags { id } paths { screenshot }";
         const data = await gqlQuery(`query {
           findScenes(scene_filter:{o_counter:{value:0,modifier:GREATER_THAN}} filter:{per_page:-1}) {
             scenes {
@@ -556,7 +574,7 @@
             if (!oPerformers.has(p.id)) oPerformers.set(p.id, p);
             if (!performerSceneCounts.has(p.id)) performerSceneCounts.set(p.id, new Set());
             performerSceneCounts.get(p.id).add(scene.id);
-            performerPlayMins.set(p.id, (performerPlayMins.get(p.id)||0) + sceneDurMins);
+            performerPlayMins.set(p.id, (performerPlayMins.get(p.id)||0) + watchedMins(scene));
             if (heightMedian!=null && hCm > heightMedian) { result.hasTallPerformer = true; tallPerformerIds.add(p.id); }
             if (heightMedian!=null && hCm > 0 && hCm < heightMedian) { result.hasPetitePerformer = true; petitePerformerIds.add(p.id); }
             if (heightP90!=null && hCm >= heightP90) top10TallIds.add(p.id);
@@ -680,6 +698,7 @@
             if (si > 1 && sceneTimestamps[si] - sceneTimestamps[si-2] <= 3600000) { timingCounts.tripleShot = (timingCounts.tripleShot||0)+1; if (!timing.tripleShot) { timing.tripleShot = true; timingRefs.tripleShot = { sceneId: scene.id }; } }
           }
 
+          const perOWatched = watchedMins(scene) / Math.max(1, (scene.o_history || []).length);
           for (const ts of (scene.o_history || [])) {
             const d = new Date(ts);
             if (isNaN(d.getTime())) continue;
@@ -723,8 +742,8 @@
             // Accumulate watch time by weekday (Rome calendar), for the Playtime
             // Patterns achievements — every O event on scene of duration sceneDurMins
             // contributes that scene's runtime to the day it happened on.
-            playtimeByWeekday[dow] = (playtimeByWeekday[dow]||0) + sceneDurMins;
-            playtimeScenesByWeekday[dow].push({ id:scene.id, title:scene.title||"(Untitled scene)", screenshot:(scene.paths&&scene.paths.screenshot)||null, rating100:scene.rating100, durMins:sceneDurMins, diffDaysLabel:dateKey(d) });
+            playtimeByWeekday[dow] = (playtimeByWeekday[dow]||0) + perOWatched;
+            playtimeScenesByWeekday[dow].push({ id:scene.id, title:scene.title||"(Untitled scene)", screenshot:(scene.paths&&scene.paths.screenshot)||null, rating100:scene.rating100, durMins:perOWatched, diffDaysLabel:dateKey(d) });
             // Senior Discount: O during siesta hours (2-4pm) with a 60+ performer
             if (sceneHasSenior && h2>=14 && h2<16) {
               seniorSiestaCount++;
@@ -857,35 +876,12 @@
       // Performer of the Year, across years: who tops each year, using the SAME weighted
       // score formula as the podium tab (scorePodiumPerformer), not just raw O count —
       // otherwise this could disagree with what's shown on that page.
-      const yearPerformerFullStats = new Map(); // year -> Map(performerId -> stats for scorePodiumPerformer)
-      scenes.forEach(scene => {
-        const history = scene.o_history || [];
-        if (!history.length) return;
-        const durMins = (scene.files && scene.files[0] && scene.files[0].duration) ? scene.files[0].duration / 60 : 0;
-        const sceneRatingNorm = scene.rating100!=null ? scene.rating100/100 : 0.6;
-        const byYear = {};
-        history.forEach(ts => { const dt=new Date(ts); if (!isNaN(dt.getTime())) { const yr=getRomeParts(dt).year; byYear[yr]=(byYear[yr]||0)+1; } });
-        Object.entries(byYear).forEach(([yr,oCount]) => {
-          const y = Number(yr);
-          const qualityMins = durMins * sceneRatingNorm * oCount;
-          if (!yearPerformerFullStats.has(y)) yearPerformerFullStats.set(y, new Map());
-          const pmap = yearPerformerFullStats.get(y);
-          (scene.performers||[]).forEach(p => {
-            if (!pmap.has(p.id)) pmap.set(p.id, { performerId:p.id, performerName:p.name||"Unknown", oCount:0, sceneCount:0, playMins:0, qualityMins:0, ratingSum:0, ratingCount:0, isFavorite:!!p.favorite });
-            const s = pmap.get(p.id);
-            s.oCount += oCount; s.sceneCount += 1; s.playMins += durMins; s.qualityMins += qualityMins;
-            if (scene.rating100!=null) { s.ratingSum += scene.rating100; s.ratingCount += 1; }
-          });
-        });
-      });
+      const yearsSeen = new Set();
+      scenes.forEach(sc => (sc.o_history||[]).forEach(ts => { const dt = new Date(ts); if (!isNaN(dt.getTime())) yearsSeen.add(getRomeParts(dt).year); }));
       const yearTop = {};
-      yearPerformerFullStats.forEach((pmap, yr) => {
-        let best = null;
-        pmap.forEach(s => {
-          const score = scorePodiumPerformer({ ...s, avgRating: s.ratingCount>0 ? s.ratingSum/s.ratingCount : 0 });
-          if (!best || score > best.score) best = { performerId:s.performerId, performerName:s.performerName, score };
-        });
-        if (best) yearTop[yr] = best;
+      yearsSeen.forEach(y => {
+        const top = buildRanking(scenes, { type:"year", value:y }, sc => sc.performers || [])[0];
+        if (top) yearTop[y] = { performerId:top.id, performerName:top.name, score:top.score };
       });
       const champCounts = {};
       Object.values(yearTop).forEach(entry => { champCounts[entry.performerId] = (champCounts[entry.performerId]||0) + 1; });
@@ -904,36 +900,18 @@
       // Monthly Breakdown tab, but grouped by calendar month instead of year, to
       // find the month with the most distinct scoring performers (Crowded Field/
       // Packed House) and the month with the tightest #1-vs-#2 race (Photo Finish).
-      const monthPerformerStats = new Map(); // "YYYY-MM" -> Map(performerId -> stats)
-      scenes.forEach(scene => {
-        const history = scene.o_history || [];
-        if (!history.length) return;
-        const durMins = (scene.files && scene.files[0] && scene.files[0].duration) ? scene.files[0].duration / 60 : 0;
-        const sceneRatingNorm = scene.rating100!=null ? scene.rating100/100 : 0.6;
-        const byMonth = {};
-        history.forEach(ts => { const dt=new Date(ts); if (!isNaN(dt.getTime())) { const rp2=getRomeParts(dt); const mk=`${rp2.year}-${String(rp2.month+1).padStart(2,"0")}`; byMonth[mk]=(byMonth[mk]||0)+1; } });
-        Object.entries(byMonth).forEach(([mk,oCount]) => {
-          const qualityMins = durMins * sceneRatingNorm * oCount;
-          if (!monthPerformerStats.has(mk)) monthPerformerStats.set(mk, new Map());
-          const pmap = monthPerformerStats.get(mk);
-          (scene.performers||[]).forEach(p => {
-            if (!pmap.has(p.id)) pmap.set(p.id, { performerId:p.id, performerName:p.name||"Unknown", oCount:0, sceneCount:0, playMins:0, qualityMins:0, ratingSum:0, ratingCount:0, isFavorite:!!p.favorite });
-            const s = pmap.get(p.id);
-            s.oCount += oCount; s.sceneCount += 1; s.playMins += durMins; s.qualityMins += qualityMins;
-            if (scene.rating100!=null) { s.ratingSum += scene.rating100; s.ratingCount += 1; }
-          });
-        });
-      });
+      const monthsSeen = new Set();
+      scenes.forEach(sc => (sc.o_history||[]).forEach(ts => { const dt = new Date(ts); if (!isNaN(dt.getTime())) monthsSeen.add(monthKeyOf(dt)); }));
       let maxCompetitorsMonth = 0, maxCompetitorsInfo = null;
       let closestRaceGap = Infinity, closestRaceInfo = null;
-      monthPerformerStats.forEach((pmap, mk) => {
-        if (pmap.size > maxCompetitorsMonth) { maxCompetitorsMonth = pmap.size; maxCompetitorsInfo = { month:mk, count:pmap.size }; }
-        if (pmap.size >= 2) {
-          const scored = Array.from(pmap.values())
-            .map(s => ({ performerId:s.performerId, performerName:s.performerName, score:scorePodiumPerformer({ ...s, avgRating: s.ratingCount>0 ? s.ratingSum/s.ratingCount : 0 }) }))
-            .sort((a,b)=>b.score-a.score);
-          const gap = scored[0].score - scored[1].score;
-          if (gap < closestRaceGap) { closestRaceGap = gap; closestRaceInfo = { month:mk, gap, top:scored[0], second:scored[1] }; }
+      monthsSeen.forEach(mk => {
+        const r = buildRanking(scenes, { type:"month", value:mk }, sc => sc.performers || []);
+        if (r.length > maxCompetitorsMonth) { maxCompetitorsMonth = r.length; maxCompetitorsInfo = { month:mk, count:r.length }; }
+        if (r.length >= 2) {
+          const gap = r[0].score - r[1].score;
+          if (gap < closestRaceGap) { closestRaceGap = gap; closestRaceInfo = { month:mk, gap,
+            top:{ performerId:r[0].id, performerName:r[0].name, score:r[0].score },
+            second:{ performerId:r[1].id, performerName:r[1].name, score:r[1].score } }; }
         }
       });
       result.maxCompetitorsMonth = maxCompetitorsMonth;
@@ -1210,7 +1188,7 @@
       if (created.length) {
         const oldest = created.reduce((a,b)=> a<b?a:b);
         result.libraryAgeDays = Math.floor((Date.now() - oldest.getTime()) / 86400000);
-        const monthSet = new Set(created.map(d => `${d.getFullYear()}-${d.getMonth()}`));
+        const monthSet = new Set(created.map(monthKeyOf));
         result.activeMonthCount = monthSet.size;
       }
       // validScenes is already sorted ascending by created_at, so index N-1 is the Nth scene added
@@ -1229,7 +1207,7 @@
         const dk = dateKey(d);
         if (!dayScenesMap.has(dk)) dayScenesMap.set(dk, []);
         dayScenesMap.get(dk).push(s.id);
-        const mk = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+        const mk = monthKeyOf(d);
         if (!monthScenesMap.has(mk)) monthScenesMap.set(mk, []);
         monthScenesMap.get(mk).push(s.id);
       });
@@ -1352,7 +1330,7 @@
       ev.forEach(x => entFn(x.sc).forEach(en => {
         const k = en + "|" + x.sc.id; if (seen.has(k)) return; seen.add(k);
         const p = per.get(en) || { sum:0, at:null };
-        p.sum += durMins(x.sc);
+        p.sum += watchedMins(x.sc);
         if (p.at == null && p.sum >= mins) p.at = x.ms;
         per.set(en, p);
       }));
@@ -1372,9 +1350,9 @@
     const pm = d.performerMilestones || {};
     [10, 100, 250, 500].forEach(n => { if (pm[n] && pm[n].created_at) set("performer-" + n, new Date(pm[n].created_at).getTime()); });
     if (cm.length) { set("library-age-1y", cm[0] + 365*86400000); set("library-age-3y", cm[0] + 1095*86400000); }
-    { const seen = new Set(); cm.forEach(ms => { const dt = new Date(ms); const k = `${dt.getFullYear()}-${dt.getMonth()}`; if (!seen.has(k)) { seen.add(k); if (seen.size === 6) set("active-months-6", ms); if (seen.size === 12) set("active-months-12", ms); } }); }
+    { const seen = new Set(); cm.forEach(ms => { const dt = new Date(ms); const k = monthKeyOf(dt); if (!seen.has(k)) { seen.add(k); if (seen.size === 6) set("active-months-6", ms); if (seen.size === 12) set("active-months-12", ms); } }); }
     const burst = (keyFn, n) => { const c = new Map(); for (const ms of cm) { const k = keyFn(new Date(ms)); const v = (c.get(k) || 0) + 1; c.set(k, v); if (v >= n) return ms; } return null; };
-    const monthKey = dt => `${dt.getFullYear()}-${dt.getMonth()}`;
+    const monthKey = monthKeyOf;
     set("bulk-import-day", burst(dateKey, 50));  set("mega-import-day", burst(dateKey, 200));
     set("big-month", burst(monthKey, 100));      set("massive-month", burst(monthKey, 500));
 
@@ -1445,7 +1423,7 @@
       const wk = [0,0,0,0,0,0,0];
       const PT = { "weekend-marathon":[w=>w[0]+w[6],600], "friday-night-fever":[w=>w[5],300], "sunday-funday":[w=>w[0],180], "hump-day-hustle":[w=>w[3],180], "monday-marathon":[w=>w[1],300] };
       const ptDone = {};
-      ev.forEach(x => { wk[getRomeParts(new Date(x.ms)).weekday] += durMins(x.sc); Object.keys(PT).forEach(id => { if (ptDone[id] == null && PT[id][0](wk) >= PT[id][1]) ptDone[id] = x.ms; }); });
+      ev.forEach(x => { wk[getRomeParts(new Date(x.ms)).weekday] += watchedMins(x.sc) / Math.max(1, (x.sc.o_history||[]).length); Object.keys(PT).forEach(id => { if (ptDone[id] == null && PT[id][0](wk) >= PT[id][1]) ptDone[id] = x.ms; }); });
       Object.keys(ptDone).forEach(id => set(id, ptDone[id]));
 
       // ── Scenes
@@ -2378,6 +2356,15 @@
     return [];
   }
 
+  function watchedMins(sc) { return (Number(sc.play_duration) || 0) / 60; }
+  function watchedMinsInScope(sc, scope) {
+    const total = watchedMins(sc);
+    if (!total) return 0;
+    if (scope.type === "all") return total;
+    const plays = sc.play_history || [];
+    return plays.length ? total * oEventsInScope(plays, scope).length / plays.length : 0;
+  }
+
   function buildRanking(scenes, scope, getEntities) {
     const map = new Map();
     scenes.forEach(scene => {
@@ -2390,9 +2377,9 @@
         oCount = scene.o_counter;
       }
       if (!oCount) return;
-      const durMins = (scene.files && scene.files[0] && scene.files[0].duration) ? scene.files[0].duration / 60 : 0;
+      const durMins = watchedMinsInScope(scene, scope);
       const sceneRatingNorm = scene.rating100!=null ? scene.rating100/100 : 0.6;
-      const qualityMins = durMins * sceneRatingNorm * oCount;
+      const qualityMins = durMins * sceneRatingNorm;
       const eventTimes = eventsInScope.length ? eventsInScope.map(ts=>new Date(ts).getTime()) : [Date.now()];
       const entities = getEntities(scene) || [];
       entities.forEach(ent => {
@@ -2402,7 +2389,7 @@
         s.oCount += oCount; s.sceneCount += 1; s.playMins += durMins; s.qualityMins += qualityMins;
         if (scene.rating100!=null) { s.ratingSum += scene.rating100; s.ratingCount += 1; }
         if (ent.favorite) s.isFavorite = true;
-        eventTimes.forEach(t => { s.scenes.push({ sceneId:scene.id, title:scene.title||"(Untitled scene)", rating100:scene.rating100, durMins, screenshot:(scene.paths&&scene.paths.screenshot)||null, firstO:t }); });
+        eventTimes.forEach(t => { s.scenes.push({ sceneId:scene.id, title:scene.title||"(Untitled scene)", rating100:scene.rating100, durMins: durMins/eventTimes.length, screenshot:(scene.paths&&scene.paths.screenshot)||null, firstO:t }); });
       });
     });
     return Array.from(map.values())
@@ -2417,7 +2404,7 @@
   async function fetchOScenesForRanking() {
     const data = await gqlQuery(`query {
       findScenes(scene_filter:{o_counter:{value:0,modifier:GREATER_THAN}} filter:{per_page:-1}) {
-        scenes { id title o_history o_counter rating100 paths { screenshot } files { duration } tags { id } performers { id name image_path favorite ${PERF_FILTER_FIELDS} } studio { id name image_path } }
+        scenes { id title o_history o_counter rating100 paths { screenshot } files { duration } play_duration play_history tags { id name } performers { id name image_path favorite ${PERF_FILTER_FIELDS} } studio { id name image_path } }
       }
     }`);
     return data.findScenes.scenes;
@@ -2697,13 +2684,13 @@
           const screenshot = (s.paths && s.paths.screenshot) || null;
           const added = new Date(s.created_at);
           if (!isNaN(added.getTime())) {
-            const am = ensure(`${added.getFullYear()}-${String(added.getMonth()+1).padStart(2,"0")}`);
+            const am = ensure(monthKeyOf(added));
             am.addedScenes.push({ id:s.id, title:s.title||"(Untitled scene)", screenshot, rating100:s.rating100, durMins, diffDaysLabel:dateKey(added) });
           }
           (s.o_history || []).forEach(ts => {
             const d = new Date(ts);
             if (isNaN(d.getTime())) return;
-            const m = ensure(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`);
+            const m = ensure(monthKeyOf(d));
             m.oCount += 1; m.playMins += durMins;
             if (s.rating100 != null) { m.ratingSum += s.rating100; m.ratingCount += 1; }
             m.oScenes.push({ id:s.id, title:s.title||"(Untitled scene)", screenshot, rating100:s.rating100, durMins, diffDaysLabel:dateKey(d) });
@@ -2873,6 +2860,7 @@
       while (cells.length % 7) cells.push(null);
     }
 
+    const todayP = getRomeToday();
     return h("div", { style: { display: "grid", gridTemplateColumns: `repeat(7, ${size}px)`, gap: "4px", width: "max-content" } },
       ["M","T","W","T","F","S","S"].map((l, i) =>
         h("div", { key: "h"+i, style: { textAlign: "center", fontSize: "0.65rem", opacity: 0.5 } }, l)),
@@ -2895,6 +2883,7 @@
             cursor: count > 0 ? "pointer" : "default",
             display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
             fontSize: big ? "0.8rem" : "0.6rem", lineHeight: 1.1,
+            ...(todayP.year === year && todayP.month === month && todayP.day === d ? { outline:"2px solid #ffc850", outlineOffset:"1px" } : {}),
           },
         },
           h("span", { style: { opacity: count ? 0.9 : 0.45 } }, d),
@@ -2958,7 +2947,7 @@
           const d = new Date(s.created_at);
           if (isNaN(d.getTime())) return;
           const k = dateKey(d);
-          if (!dayMap.has(k)) dayMap.set(k, { date:k, year:d.getFullYear(), scenes:[] });
+          if (!dayMap.has(k)) dayMap.set(k, { date:k, year:getRomeParts(d).year, scenes:[] });
           dayMap.get(k).scenes.push(sceneInfo(s));
         });
         const growthDays = Array.from(dayMap.values()).sort((a,b)=>b.date.localeCompare(a.date));
@@ -3049,7 +3038,7 @@
           const info = sceneInfo(s);
           const hist = (s.o_history||[]).map(ts=>new Date(ts)).filter(dt=>!isNaN(dt.getTime())).sort((a,b)=>a-b);
           hist.forEach((d,i) => {
-            const k = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+            const k = monthKeyOf(d);
             if (!rewatchMonthMap.has(k)) rewatchMonthMap.set(k, { month:k, total:0, rewatch:0, scenes:[] });
             const m = rewatchMonthMap.get(k);
             m.total += 1;
@@ -3288,6 +3277,7 @@
             return `hsl(${hue}, 72%, ${light}%)`;
           };
           const fmtHour = h2 => `${String(h2).padStart(2,"0")}:00`;
+          const nowHour = getRomeParts(new Date()).hour;
           return h(React.Fragment, null,
             h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "How your O's are distributed across the hours of the day. Click an hour to see its scenes."),
             h("div", { style:{ display:"grid", gridTemplateColumns:"repeat(12, 1fr)", gap:"4px", marginBottom:"0.75rem" } },
@@ -3299,6 +3289,7 @@
                     style:{
                       background:hourColor(b.count), borderRadius:"6px", padding:"0.5rem 0.25rem",
                       textAlign:"center", cursor: b.count>0?"pointer":"default",
+                      ...(b.hour === nowHour ? { outline:"2px solid #ffc850", outlineOffset:"1px" } : {}),
                       display:"flex", flexDirection:"column", alignItems:"center", gap:"0.15rem",
                     },
                   },
@@ -3895,7 +3886,9 @@
     const [selectedSceneId, setSelectedSceneId] = useState(null);
     const [showAll, setShowAll] = useState(false);
     const [bucketFilter, setBucketFilter] = useState(null); // null = all, 0-9 = rating range
-    const [sortDir, setSortDir] = useState("desc");         // "desc" = best first, "asc" = worst first
+    const [sortDir, setSortDir] = useState("desc");
+    const [unratedModal, setUnratedModal] = useState(false);
+    const [fPerf, setFPerf] = useState(""), [fScene, setFScene] = useState(""), [fTag, setFTag] = useState(""), [fDay, setFDay] = useState("");         // "desc" = best first, "asc" = worst first
 
     useEffect(() => {
       let cancelled = false;
@@ -3903,23 +3896,30 @@
         try {
           if (!window.stashORatings) throw new Error("The stashOratings plugin isn't loaded. Install and enable it first.");
           const [ratings, comments, scenes] = await Promise.all([window.stashORatings.getAll(), window.stashORatings.getComments(), fetchOScenesForRanking()]);
-          const items = []; let unrated = 0;
+          const items = []; let unrated = 0; const unratedList = [];
           scenes.forEach(sc => {
             // Every O (first one included) has its own independent rating.
             const hist = (sc.o_history || []).map(ts => new Date(ts).getTime()).filter(t => !isNaN(t)).sort((x, y) => x - y);
             hist.forEach((t, idx) => {
               const r = ratings[`${sc.id}|${t}`] == null ? null : ratings[`${sc.id}|${t}`];
-              if (r == null) { unrated++; return; }
+              if (r == null) {
+                unrated++;
+                unratedList.push({ id: sc.id, t, title: sc.title || "(Untitled scene)", screenshot: (sc.paths && sc.paths.screenshot) || null,
+                  performerNames: (sc.performers || []).map(p => p.name).filter(Boolean), rating100: sc.rating100,
+                  oRating100: null, oComment: comments[`${sc.id}|${t}`] || null, diffDaysLabel: dateKey(new Date(t)) });
+                return;
+              }
               items.push({
                 sceneId: sc.id, title: sc.title || "(Untitled scene)",
                 screenshot: (sc.paths && sc.paths.screenshot) || null,
                 performerNames: (sc.performers || []).map(p => p.name).filter(Boolean),
+                tagNames: (sc.tags || []).map(t => t.name).filter(Boolean),
                 rating100: r, t, first: idx === 0, comment: comments[`${sc.id}|${t}`] || null,
               });
             });
           });
           items.sort((a, b) => b.rating100 - a.rating100 || b.t - a.t);
-          if (!cancelled) setState({ loading:false, error:null, data:{ items, unrated } });
+          if (!cancelled) setState({ loading:false, error:null, data:{ items, unrated, unratedList: unratedList.sort((a, b) => b.t - a.t) } });
         } catch (err) { if (!cancelled) setState({ loading:false, error:err.message, data:null }); }
       })();
       return () => { cancelled = true; };
@@ -3927,7 +3927,7 @@
 
     if (state.loading) return h("div", { className:"stash-plus-loading" }, "Loading O ratings…");
     if (state.error)   return h("div", { className:"stash-plus-error" }, "Error: " + state.error);
-    const { items, unrated } = state.data;
+    const { items, unrated, unratedList } = state.data;
     if (!items.length) return h("div", { className:"stash-plus-loading" }, "No rated O's yet. Rate one with the popup next to the O button.");
 
     const vals = items.map(i => i.rating100 / 10);
@@ -3937,8 +3937,17 @@
     const buckets = Array.from({ length:10 }, (_, i) => ({ idx:i, label:`${i}-${i + 1}`, count:0, performers:[], selectable:true, active:bucketFilter === i }));
     vals.forEach(v => { buckets[Math.min(9, Math.floor(v))].count++; });
     const bucketOf = i => Math.min(9, Math.floor(i.rating100 / 10));
+    const fp = normName(fPerf), fs = normName(fScene), ft = normName(fTag);
+    const matches = i =>
+      (!fp || i.performerNames.some(n => normName(n).includes(fp))) &&
+      (!fs || normName(i.title).includes(fs)) &&
+      (!ft || i.tagNames.some(n => normName(n).includes(ft))) &&
+      (!fDay || monthKeyOf(new Date(i.t)) === fDay);
+    const filterBox = (ph, val, set) => h("input", { type:"text", value:val, placeholder:ph, className:"podium-year-select",
+      onChange:e => { set(e.target.value); setShowAll(false); }, style:{ width:"150px" } });
     const filtered = (bucketFilter == null ? items : items.filter(i => bucketOf(i) === bucketFilter))
       .slice()
+      .filter(matches)
       .sort(sortDir === "asc" ? (x, y) => x.rating100 - y.rating100 || x.t - y.t : (x, y) => y.rating100 - x.rating100 || y.t - x.t);
     const shown = showAll ? filtered : filtered.slice(0, 25);
 
@@ -3954,7 +3963,7 @@
     return h("div", null,
       h(CollapsibleSection, { title:"📊 O Rating Stats", storageKey:"oRatingStats" },
         h("div", { className:"stash-plus-grid" },
-          stat("🗳️", "Rated O's", `${items.length}` + (unrated ? ` (${unrated} still unrated)` : "")),
+          stat("🗳️", "Rated O's", `${items.length}` + (unrated ? ` (${unrated} still unrated, click to list)` : ""), unrated ? () => setUnratedModal(true) : undefined),
           stat("📊", "Average", `${avg.toFixed(2)}/10`),
           stat("📐", "Median", `${median.toFixed(1)}/10`),
           stat("🥇", "Best O", `${best.title} — ${(best.rating100 / 10).toFixed(1)}/10`, () => setSelectedSceneId(best.sceneId)),
@@ -3966,6 +3975,15 @@
         )
       ),
       h(CollapsibleSection, { title:"🏆 O Ranking (" + (sortDir === "asc" ? "worst → best" : "best → worst") + ")", storageKey:"oRatingRanking" },
+        h("div", { style:{ display:"flex", gap:"0.5rem", flexWrap:"wrap", marginBottom:"0.6rem" } },
+          filterBox("🎭 Performer…", fPerf, setFPerf),
+          filterBox("🎬 Scene…", fScene, setFScene),
+          filterBox("🏷️ Tag…", fTag, setFTag),
+          h("input", { type:"month", value:fDay, className:"podium-year-select", onClick:openMonthPicker,
+            onChange:e => { setFDay(e.target.value); setShowAll(false); } }),
+          (fPerf || fScene || fTag || fDay) && h("button", { className:"podium-year-select",
+            onClick:() => { setFPerf(""); setFScene(""); setFTag(""); setFDay(""); } }, "Clear ✕")
+        ),
         h("div", { style:{ display:"flex", alignItems:"center", gap:"0.6rem", flexWrap:"wrap", marginBottom:"0.75rem" } },
           h("button", { className:"podium-year-select", title:"Toggle sort order", onClick:() => setSortDir(sortDir === "desc" ? "asc" : "desc") },
             sortDir === "desc" ? "⬇ Best first" : "⬆ Worst first"),
@@ -3987,6 +4005,8 @@
         filtered.length > 25 && h("button", { className:"podium-show-more", onClick:() => setShowAll(!showAll) },
           showAll ? "Show less ▲" : `Show all ${filtered.length} O's ▼`)
       ),
+      unratedModal && h(SceneListModal, { heading:"🗳️ Unrated O's", subheading:`${unratedList.length} O${unratedList.length !== 1 ? "'s" : ""} without a rating, newest first.`, scenes:unratedList,
+        onClose:() => setUnratedModal(false), onSelectScene:sid => { setUnratedModal(false); setSelectedSceneId(sid); } }),
       selectedSceneId && h(SceneInfoModal, { sceneId:selectedSceneId, onClose:() => setSelectedSceneId(null) })
     );
   }
@@ -4007,6 +4027,7 @@
 
   function SettingsPage() {
     const [settings, setSettings] = useState(getSettings);
+    const [tz, setTz] = useState(getTZ);
     const [tagQuery, setTagQuery] = useState("");
     const [tagResults, setTagResults] = useState([]);
     const update = next => { setSettings(next); saveSettings(next); };
@@ -4031,6 +4052,13 @@
 
     return h("div", null,
       h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "These settings apply to Stats, Performer of the Year, Monthly Breakdown and For You. Reopen those tabs to see the changes."),
+      h("div", { className:"stash-plus-category" },
+        h("h2", null, "🌍 Timezone"),
+        h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "Used for every achievement, stat and calendar. Reopen the tabs to apply."),
+        h("select", { className:"podium-year-select", value:tz,
+          onChange:e => { setTZ(e.target.value); setTz(e.target.value); scheduleBackgroundCheck(0); } },
+          (TIMEZONES.includes(tz) ? TIMEZONES : [tz].concat(TIMEZONES)).map(z => h("option", { key:z, value:z }, z)))
+      ),
       h("div", { className:"stash-plus-category" },
         h("h2", null, "🚻 Performer genders"),
         h("p", { className:"stash-plus-score-note", style:{ marginTop:0 } }, "Only performers matching all the filters below are counted. While a performer filter is active, scenes with no matching performer are left out."),
